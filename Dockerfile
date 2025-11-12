@@ -36,7 +36,8 @@ RUN pnpm install --frozen-lockfile
 # Copy built Next.js app
 COPY --from=builder /app/.next ./.next
 COPY --from=builder /app/public ./public
-COPY --from=builder /app/server.ts ./server.ts
+COPY --from=builder /app/colyseus-server.ts ./colyseus-server.ts
+COPY --from=builder /app/colyseus-server ./colyseus-server
 
 # Set production environment AFTER installing dependencies
 ENV NODE_ENV=production

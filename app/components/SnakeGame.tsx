@@ -2,7 +2,8 @@
 
 import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
-import { io, Socket } from 'socket.io-client';
+import { Client, Room } from 'colyseus.js';
+import type { GameState, Player } from '../../colyseus-server/schema/GameState';
 
 // Upgrade types
 type UpgradeType =
@@ -272,9 +273,10 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
             },
         };
 
-        // Socket.IO connection
-        let socket: Socket | null = null;
+        // Colyseus connection
+        let room: Room<GameState> | null = null;
         let myPlayerId: string | null = null;
+        const client = new Client(window.location.protocol.replace('http', 'ws') + '//' + window.location.host);
 
         // Helper function to create a snake-like head with eyes
         const createSnakeHead = (color: number | THREE.Color): THREE.Group => {
@@ -382,9 +384,14 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
             // Handle spawn/respawn with space
             if (e.key === ' ' || e.key === 'Enter') {
                 if (!gameStateRef.current.spawned || gameStateRef.current.gameOver) {
-                    // Request spawn from server
-                    if (socket) {
-                        socket.emit('request-respawn');
+                    // Request spawn from server (server generates position)
+                    const myPlayer = room?.state.players.get(myPlayerId || '');
+                    if (room && myPlayer) {
+                        room.send('spawn', {
+                            x: myPlayer.x,
+                            y: myPlayer.y,
+                            z: myPlayer.z,
+                        });
                     }
 
                     // Reset game state for new spawn
@@ -1336,15 +1343,15 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
                     gameState.snake.trail = [];
                     console.log('[CLIENT] Cleared my trail mesh');
 
-                    // Notify server of death and send trail data for items
-                    if (socket) {
-                        console.log('[CLIENT] Emitting player-died event to server with', trailData.length, 'trail points');
-                        socket.emit('player-died', {
+                    // Notify server of death
+                    if (room) {
+                        console.log('[CLIENT] Sending player-died to Colyseus');
+                        room.send('player-died', {
                             trail: trailData,
                         });
-                        console.log('[CLIENT] player-died event sent');
+                        console.log('[CLIENT] player-died sent');
                     } else {
-                        console.log('[CLIENT] ERROR: No socket connection, cannot notify server of death');
+                        console.log('[CLIENT] ERROR: No room connection, cannot notify server of death');
                     }
 
                     console.log('[CLIENT] ===== DEATH HANDLING COMPLETE =====');
@@ -1940,14 +1947,12 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
                     }
                 }
 
-                // Send player update to server (throttled)
-                if (socket && frameCount % 2 === 0) {
-                    socket.emit('player-update', {
-                        position: {
-                            x: gameState.snake.position.x,
-                            y: gameState.snake.position.y,
-                            z: gameState.snake.position.z,
-                        },
+                // Send player update to server (throttled to 30Hz)
+                if (room && frameCount % 2 === 0) {
+                    room.send('move', {
+                        x: gameState.snake.position.x,
+                        y: gameState.snake.position.y,
+                        z: gameState.snake.position.z,
                         direction: {
                             x: gameState.snake.direction.x,
                             y: gameState.snake.direction.y,
@@ -2432,238 +2437,111 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
         console.log('[GAME] Setting isLoading to false');
         setIsLoading(false);
 
-        // Set up multiplayer connection
-        socket = io({
-            path: '/socket.io',
-        });
+        // Set up multiplayer connection with Colyseus
+        (async () => {
+            try {
+                room = await client.joinOrCreate('game');
+                myPlayerId = room.sessionId;
 
-        socket.on('player-id', (id: string) => {
-            myPlayerId = id;
-            console.log('My player ID:', id);
+                console.log('[COLYSEUS] Connected! Session ID:', myPlayerId);
 
-            // Get our spawn data from server
-            const playerData = Array.from(gameState.multiplayerPlayers.values()).find(p => p.id === id);
-            // Note: We'll get the position through player-joined event for ourselves
+                // Get initial player data (color)
+                const myPlayer = room.state.players.get(myPlayerId);
+                if (myPlayer && myPlayer.color) {
+                    const hue = parseInt(myPlayer.color.match(/\d+/)?.[0] || '0');
+                    const colorNum = new THREE.Color().setHSL(hue / 360, 0.7, 0.5).getHex();
 
-            // Update initial player count
-            updatePlayersOnlineCount();
-        });
+                    head.traverse((child) => {
+                        if (child instanceof THREE.Mesh && child.material instanceof THREE.MeshStandardMaterial) {
+                            if (child.material.color.getHex() !== 0xffffff && child.material.color.getHex() !== 0x000000) {
+                                child.material.color.setHex(colorNum);
+                                child.material.emissive.setHex(colorNum);
+                            }
+                        }
+                    });
 
-        // Listen for our own spawn data
-        socket.on('player-spawn-data', (data: any) => {
-            console.log('Received spawn data:', data);
+                    snakeLight.color.setHex(colorNum);
+                    setMyPlayerColor('#' + colorNum.toString(16).padStart(6, '0'));
+                }
 
-            // Update player color (sent on initial connection)
-            if (data.color && data.color.startsWith('hsl')) {
-                const hue = parseInt(data.color.match(/\d+/)?.[0] || '0');
-                const colorNum = new THREE.Color().setHSL(hue / 360, 0.7, 0.5).getHex();
+                // Listen for new players being added
+                (room.state.players as any).onAdd((player: Player, sessionId: string) => {
+                    console.log('[COLYSEUS] Player added:', sessionId);
 
-                // Update all colored parts of the snake head (it's a Group now)
-                head.traverse((child) => {
-                    if (child instanceof THREE.Mesh && child.material instanceof THREE.MeshStandardMaterial) {
-                        // Update main head and snout, but not eyes
-                        if (child.material.color.getHex() !== 0xffffff && child.material.color.getHex() !== 0x000000) {
-                            child.material.color.setHex(colorNum);
-                            child.material.emissive.setHex(colorNum);
+                    if (sessionId !== myPlayerId && player.spawned) {
+                        const position = new THREE.Vector3(player.x, player.y, player.z);
+                        const direction = new THREE.Vector3(1, 0, 0);
+
+                        const multiPlayer = createMultiplayerPlayer(
+                            sessionId,
+                            player.color,
+                            position,
+                            direction
+                        );
+                        gameState.multiplayerPlayers.set(sessionId, multiPlayer);
+                        updatePlayersOnlineCount();
+                    }
+                });
+
+                // Listen for player state changes
+                (room.state.players as any).onChange((player: Player, sessionId: string) => {
+                    if (sessionId === myPlayerId) return; // Skip self
+
+                    const multiPlayer = gameState.multiplayerPlayers.get(sessionId);
+
+                    if (player.spawned && !multiPlayer) {
+                        // Player just spawned - create them
+                        const position = new THREE.Vector3(player.x, player.y, player.z);
+                        const direction = new THREE.Vector3(1, 0, 0);
+
+                        const newPlayer = createMultiplayerPlayer(
+                            sessionId,
+                            player.color,
+                            position,
+                            direction
+                        );
+                        gameState.multiplayerPlayers.set(sessionId, newPlayer);
+                        console.log('[COLYSEUS] Player spawned:', sessionId);
+                        updatePlayersOnlineCount();
+                    } else if (multiPlayer) {
+                        if (player.spawned) {
+                            // Update position (smooth interpolation via targetPosition)
+                            multiPlayer.targetPosition.set(player.x, player.y, player.z);
+                            multiPlayer.length = player.length;
+                        } else {
+                            // Player died - remove from scene
+                            scene.remove(multiPlayer.head);
+                            scene.remove(multiPlayer.light);
+                            if (multiPlayer.trailMesh) {
+                                disposeTrailMesh(multiPlayer.trailMesh);
+                            }
+                            gameState.multiplayerPlayers.delete(sessionId);
+                            console.log('[COLYSEUS] Player died:', sessionId);
+                            updatePlayersOnlineCount();
                         }
                     }
                 });
 
-                snakeLight.color.setHex(colorNum);
-                setMyPlayerColor('#' + colorNum.toString(16).padStart(6, '0'));
-            }
-
-            // Update position/direction when spawning
-            if (data.position) {
-                gameState.snake.position.set(data.position.x, data.position.y, data.position.z);
-                head.position.copy(gameState.snake.position);
-
-                // Initialize trail with just 2 close points - will build naturally as snake moves
-                if (gameState.snake.trail.length < 2) {
-                    gameState.snake.trail = [
-                        gameState.snake.position.clone(),
-                        gameState.snake.position.clone().sub(gameState.snake.direction.clone().multiplyScalar(0.1)),
-                    ];
-                }
-                gameState.snake.spawnFrameCount = 0; // Reset spawn frame counter
-            }
-            if (data.direction) {
-                gameState.snake.direction.set(data.direction.x, data.direction.y, data.direction.z);
-            }
-        });
-
-        socket.on('current-players', (players: any[]) => {
-            console.log('Current players received:', players.length, 'My ID:', myPlayerId);
-            players.forEach((playerData) => {
-                console.log('Processing player:', playerData.id, playerData.position);
-                if (playerData.id !== myPlayerId) {
-                    const player = createMultiplayerPlayer(
-                        playerData.id,
-                        playerData.color,
-                        playerData.position,
-                        playerData.direction
-                    );
-                    gameState.multiplayerPlayers.set(playerData.id, player);
-                    console.log('Added player to scene:', playerData.id);
-                }
-            });
-
-            updatePlayersOnlineCount();
-        });
-
-        socket.on('player-joined', (playerData: any) => {
-            console.log('Player joined/respawned:', playerData.id, 'My ID:', myPlayerId, 'Position:', playerData.position);
-            if (playerData.id !== myPlayerId) {
-                // Check if player already exists (respawn case)
-                let player = gameState.multiplayerPlayers.get(playerData.id);
-
-                if (!player) {
-                    // New player - create them
-                    player = createMultiplayerPlayer(
-                        playerData.id,
-                        playerData.color,
-                        playerData.position,
-                        playerData.direction
-                    );
-                    gameState.multiplayerPlayers.set(playerData.id, player);
-                    console.log('Created new multiplayer player');
-                } else {
-                    // Existing player respawning - update position and make visible
-                    console.log('Player respawned, updating position');
-                    if (playerData.position) {
-                        player.position.set(playerData.position.x, playerData.position.y, playerData.position.z);
-                        player.head.position.copy(player.position);
-                    }
-                    if (playerData.direction) {
-                        player.direction.set(playerData.direction.x, playerData.direction.y, playerData.direction.z);
-                    }
-                    // Initialize trail with multiple points spread behind the head
-                    const playerBackDir = player.direction.clone().multiplyScalar(-1);
-                    player.trail = [
-                        player.position.clone(),
-                        player.position.clone().add(playerBackDir.clone().multiplyScalar(0.8)),
-                        player.position.clone().add(playerBackDir.clone().multiplyScalar(1.6)),
-                        player.position.clone().add(playerBackDir.clone().multiplyScalar(2.4)),
-                    ];
-                    if (player.trailMesh) {
-                        disposeTrailMesh(player.trailMesh);
-                        player.trailMesh = null;
-                    }
-                    // Make visible again
-                    player.head.visible = true;
-                    player.light.visible = true;
-                }
-
-                console.log('Total multiplayer players:', gameState.multiplayerPlayers.size);
-            }
-
-            updatePlayersOnlineCount();
-        });
-
-        let lastMoveLog = 0;
-        socket.on('player-moved', (data: any) => {
-            const player = gameState.multiplayerPlayers.get(data.id);
-            if (player) {
-                // Set target positions for smooth interpolation instead of snapping
-                if (data.position && typeof data.position.x === 'number' && isFinite(data.position.x)) {
-                    player.targetPosition.set(data.position.x, data.position.y, data.position.z);
-                }
-                if (data.direction && typeof data.direction.x === 'number' && isFinite(data.direction.x)) {
-                    player.targetDirection.set(data.direction.x, data.direction.y, data.direction.z);
-                }
-                if (data.trail && Array.isArray(data.trail)) {
-                    // Validate and filter trail points before creating Vector3 objects
-                    const newPoints: THREE.Vector3[] = [];
-                    for (const p of data.trail) {
-                        if (p &&
-                            typeof p.x === 'number' && typeof p.y === 'number' && typeof p.z === 'number' &&
-                            isFinite(p.x) && isFinite(p.y) && isFinite(p.z)) {
-                            newPoints.push(new THREE.Vector3(p.x, p.y, p.z));
+                // Listen for players being removed (disconnect)
+                (room.state.players as any).onRemove((player: Player, sessionId: string) => {
+                    const multiPlayer = gameState.multiplayerPlayers.get(sessionId);
+                    if (multiPlayer) {
+                        scene.remove(multiPlayer.head);
+                        scene.remove(multiPlayer.light);
+                        if (multiPlayer.trailMesh) {
+                            disposeTrailMesh(multiPlayer.trailMesh);
                         }
+                        gameState.multiplayerPlayers.delete(sessionId);
+                        console.log('[COLYSEUS] Player removed:', sessionId);
+                        updatePlayersOnlineCount();
                     }
-                    // Only update if we have valid new data
-                    if (newPoints.length >= 2) {
-                        player.trail = newPoints;
-                    }
-                }
-                player.length = data.length || 20;
-
-                // Debug log (throttled)
-                if (Date.now() - lastMoveLog > 1000) {
-                    console.log('Player moved:', data.id, 'Position:', data.position, 'Trail length:', data.trail?.length);
-                    lastMoveLog = Date.now();
-                }
-            }
-        });
-
-        socket.on('player-died', (data: { id: string; trail?: any[] }) => {
-            console.log('[CLIENT] ===== PLAYER DIED EVENT =====');
-            console.log('[CLIENT] Dead player ID:', data.id);
-            console.log('[CLIENT] My player ID:', myPlayerId);
-            console.log('[CLIENT] Trail points received:', data.trail?.length);
-            console.log('[CLIENT] Is this me?', data.id === myPlayerId);
-
-            // Spawn items from the dead player's trail for everyone (including if it's me)
-            if (data.trail && data.trail.length > 0) {
-                const trailPoints = data.trail.map((p: any) => new THREE.Vector3(p.x, p.y, p.z));
-                const itemCount = Math.floor(trailPoints.length / 3);
-                console.log(`[CLIENT] Spawning ${itemCount} items from dead player trail`);
-
-                // Spawn common items at every 3rd trail point (using shared geometry!)
-                for (let i = 0; i < trailPoints.length; i += 3) {
-                    const mesh = new THREE.Mesh(itemGeometries.common, itemMaterials.common);
-                    mesh.position.copy(trailPoints[i]);
-                    scene.add(mesh);
-
-                    gameState.items.push({
-                        position: trailPoints[i].clone(),
-                        mesh: mesh,
-                        spawnTime: Date.now(),
-                        type: 'common',
-                        value: 1,
-                    });
-                }
-
-                console.log(`[CLIENT] Total items in scene now: ${gameState.items.length}`);
-            } else {
-                console.log('[CLIENT] No trail data to spawn items from');
-            }
-
-            // Remove player from scene if it's another player (not me)
-            if (data.id !== myPlayerId) {
-                const player = gameState.multiplayerPlayers.get(data.id);
-                if (player) {
-                    console.log('[CLIENT] Removing OTHER dead player from my scene:', data.id);
-                    scene.remove(player.head);
-                    scene.remove(player.light);
-                    if (player.trailMesh) {
-                        disposeTrailMesh(player.trailMesh);
-                    }
-                    gameState.multiplayerPlayers.delete(data.id);
-                } else {
-                    console.log('[CLIENT] Player not found in multiplayerPlayers map:', data.id);
-                }
-            } else {
-                console.log('[CLIENT] This is MY death event - I should already be hidden');
-            }
-            console.log('[CLIENT] ===== END PLAYER DIED EVENT =====');
-
-            updatePlayersOnlineCount();
-        });
-
-        socket.on('player-left', (id: string) => {
-            const player = gameState.multiplayerPlayers.get(id);
-            if (player) {
-                scene.remove(player.head);
-                scene.remove(player.light);
-                if (player.trailMesh) {
-                    disposeTrailMesh(player.trailMesh);
-                }
-                gameState.multiplayerPlayers.delete(id);
+                });
 
                 updatePlayersOnlineCount();
+            } catch (error) {
+                console.error('[COLYSEUS] Connection error:', error);
             }
-        });
+        })();
 
         // Don't auto-start - wait for player to press space
         // Player must press space to spawn
@@ -2688,9 +2566,9 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
             window.removeEventListener('keyup', handleKeyUp);
             window.removeEventListener('resize', handleResize);
 
-            // Disconnect socket
-            if (socket) {
-                socket.disconnect();
+            // Disconnect from Colyseus room
+            if (room) {
+                room.leave();
             }
 
             // Clean up multiplayer players

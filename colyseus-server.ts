@@ -2,7 +2,7 @@ import { createServer } from 'http';
 import { parse } from 'url';
 import next from 'next';
 import { Server } from 'colyseus';
-import { monitor } from '@colyseus/monitor';
+import { WebSocketTransport } from '@colyseus/ws-transport';
 import { GameRoom } from './colyseus-server/rooms/GameRoom';
 
 const dev = process.env.NODE_ENV !== 'production';
@@ -18,26 +18,24 @@ app.prepare().then(() => {
         handle(req, res, parsedUrl);
     });
 
-    // Create Colyseus server
+    // Create Colyseus server with explicit WebSocket transport
     const gameServer = new Server({
-        server: httpServer,
-        express: undefined,
+        transport: new WebSocketTransport({
+            server: httpServer,
+            pingInterval: 3000,
+            pingMaxRetries: 3,
+        }),
     });
 
     // Register game room
     gameServer.define('game', GameRoom);
 
-    // (Optional) Attach monitoring panel (development only)
-    if (dev) {
-        // Note: Monitor requires express, we're skipping it for simplicity
-        console.log('[COLYSEUS] Monitor not available in dev mode (requires express)');
-    }
-
-    gameServer.listen(port);
-
-    console.log(`> Ready on http://${hostname}:${port}`);
-    console.log('[COLYSEUS] Server ready');
-    console.log('[COLYSEUS] Game room available');
+    // Start listening
+    httpServer.listen(port, hostname, () => {
+        console.log(`> Ready on http://${hostname}:${port}`);
+        console.log('[COLYSEUS] Server ready');
+        console.log('[COLYSEUS] Game room available');
+    });
 }).catch((err) => {
     console.error('[ERROR] Server failed to start:', err);
     process.exit(1);

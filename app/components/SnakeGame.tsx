@@ -276,7 +276,8 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
         // Colyseus connection
         let room: Room<GameState> | null = null;
         let myPlayerId: string | null = null;
-        const client = new Client(window.location.protocol.replace('http', 'ws') + '//' + window.location.host);
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const client = new Client(`${wsProtocol}//${window.location.host}`);
 
         // Helper function to create a snake-like head with eyes
         const createSnakeHead = (color: number | THREE.Color): THREE.Group => {
@@ -716,7 +717,7 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
             }
         };
 
-        const TARGET_BOT_COUNT = 25; // Good balance for Safari with bots spawning closer
+        const TARGET_BOT_COUNT = 10; // Max 10 bots (room limit is 15 total players + bots)
 
         const manageBotCount = () => {
             const currentBotCount = gameState.bots.length;

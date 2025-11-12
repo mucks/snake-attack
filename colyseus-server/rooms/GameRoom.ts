@@ -4,10 +4,13 @@ import { GameState, Player } from '../schema/GameState';
 const gridSize = 1000;
 
 export class GameRoom extends Room<GameState> {
-    maxClients = 50;
+    maxClients = 15; // Maximum 15 players per room
 
     onCreate(options: any) {
         this.setState(new GameState());
+
+        // Increase seat reservation timeout to 20 seconds (default is 10s)
+        this.setSeatReservationTime(20);
 
         console.log('[COLYSEUS] GameRoom created');
 

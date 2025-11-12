@@ -19,11 +19,10 @@ export class GameRoom extends Room<GameState> {
             const player = this.state.players.get(client.sessionId);
             if (player) {
                 player.spawned = true;
-                player.x = message.x;
-                player.y = message.y;
-                player.z = message.z;
+                // Use server-side position (already set away from others in onJoin)
+                // Don't override with client position to ensure proper spacing
                 player.length = 5;
-                console.log(`[COLYSEUS] Player ${client.sessionId} spawned`);
+                console.log(`[COLYSEUS] Player ${client.sessionId} spawned at (${player.x.toFixed(0)}, ${player.z.toFixed(0)})`);
             }
         });
 
@@ -61,11 +60,31 @@ export class GameRoom extends Room<GameState> {
     onJoin(client: Client, options: any) {
         console.log(`[COLYSEUS] ${client.sessionId} joined`);
 
-        // Generate random spawn position
-        const angle = Math.random() * Math.PI * 2;
-        const distance = Math.random() * 100 + 50;
-        const x = Math.cos(angle) * distance;
-        const z = Math.sin(angle) * distance;
+        // Generate spawn position away from other players
+        let x = 0, z = 0;
+        let attempts = 0;
+        const minDistance = 100; // Minimum distance from other players
+
+        while (attempts < 20) {
+            const angle = Math.random() * Math.PI * 2;
+            const distance = Math.random() * 200 + 100; // Spawn further out
+            x = Math.cos(angle) * distance;
+            z = Math.sin(angle) * distance;
+
+            // Check distance from all other players
+            let tooClose = false;
+            this.state.players.forEach((otherPlayer) => {
+                const dx = x - otherPlayer.x;
+                const dz = z - otherPlayer.z;
+                const dist = Math.sqrt(dx * dx + dz * dz);
+                if (dist < minDistance) {
+                    tooClose = true;
+                }
+            });
+
+            if (!tooClose) break;
+            attempts++;
+        }
 
         // Generate random color
         const hue = Math.random() * 360;
@@ -82,7 +101,7 @@ export class GameRoom extends Room<GameState> {
 
         this.state.players.set(client.sessionId, player);
 
-        console.log(`[COLYSEUS] Player ${client.sessionId} initialized`);
+        console.log(`[COLYSEUS] Player ${client.sessionId} initialized at (${x.toFixed(0)}, ${z.toFixed(0)})`);
     }
 
     onLeave(client: Client, consented: boolean) {

@@ -96,6 +96,13 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
         upgradeOptionsRef.current = upgradeOptions;
     }, [showUpgradeChoice, upgradeOptions]);
 
+    // Sync isFocusedRef with isActive prop
+    useEffect(() => {
+        const shouldBeFocused = isActive ?? true;
+        isFocusedRef.current = shouldBeFocused;
+        console.log('[FOCUS] isFocusedRef set to:', shouldBeFocused, 'from isActive:', isActive);
+    }, [isActive]);
+
     useEffect(() => {
         console.log('[GAME] useEffect starting...', {
             hasContainer: !!containerRef.current,
@@ -276,8 +283,14 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
         // Colyseus connection
         let room: Room<GameState> | null = null;
         let myPlayerId: string | null = null;
+        let syncInterval: NodeJS.Timeout | null = null;
         const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const client = new Client(`${wsProtocol}//${window.location.host}`);
+        // In dev, connect to separate Colyseus port; in production, same port
+        const isDev = process.env.NODE_ENV === 'development';
+        const colyseusUrl = isDev
+            ? `${wsProtocol}//localhost:2567`
+            : `${wsProtocol}//${window.location.host}`;
+        const client = new Client(colyseusUrl);
 
         // Helper function to create a snake-like head with eyes
         const createSnakeHead = (color: number | THREE.Color): THREE.Group => {
@@ -359,8 +372,13 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
 
         // Input handling
         const handleKeyDown = (e: KeyboardEvent) => {
+            console.log('[INPUT] Key pressed:', e.key, 'focused:', isFocusedRef.current, 'spawned:', gameStateRef.current.spawned);
+
             // Only respond to input if this game instance is focused
-            if (!isFocusedRef.current) return;
+            if (!isFocusedRef.current) {
+                console.log('[INPUT] Not focused, ignoring input');
+                return;
+            }
 
             // Handle upgrade selection with number keys (using code for layout independence)
             if (showUpgradeChoiceRef.current) {
@@ -385,22 +403,65 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
             // Handle spawn/respawn with space
             if (e.key === ' ' || e.key === 'Enter') {
                 if (!gameStateRef.current.spawned || gameStateRef.current.gameOver) {
-                    // Request spawn from server (server generates position)
-                    const myPlayer = room?.state.players.get(myPlayerId || '');
-                    if (room && myPlayer) {
-                        room.send('spawn', {
-                            x: myPlayer.x,
-                            y: myPlayer.y,
-                            z: myPlayer.z,
-                        });
+                    console.log('[CLIENT] SPACE pressed - requesting spawn');
+
+                    // Request spawn from server (server has already set safe position)
+                    if (room) {
+                        console.log('[CLIENT] Sending spawn request to Colyseus');
+                        room.send('spawn', {});
+
+                        // Wait for server to confirm spawn, then get position
+                        let checkCount = 0;
+                        const checkSpawn = setInterval(() => {
+                            checkCount++;
+                            const myPlayer = room?.state.players.get(myPlayerId || '');
+                            console.log(`[CLIENT] Checking spawn ${checkCount}:`, {
+                                hasPlayer: !!myPlayer,
+                                spawned: myPlayer?.spawned,
+                                hasX: typeof myPlayer?.x === 'number',
+                                x: myPlayer?.x,
+                                z: myPlayer?.z
+                            });
+
+                            if (myPlayer && myPlayer.spawned &&
+                                typeof myPlayer.x === 'number' &&
+                                typeof myPlayer.y === 'number' &&
+                                typeof myPlayer.z === 'number') {
+                                clearInterval(checkSpawn);
+
+                                console.log('[CLIENT] Server confirmed spawn!');
+
+                                // Set our position to match server
+                                gameState.snake.position.set(myPlayer.x, myPlayer.y, myPlayer.z);
+                                head.position.copy(gameState.snake.position);
+
+                                // Initialize trail properly to prevent buggy long trail
+                                gameState.snake.trail = [
+                                    gameState.snake.position.clone(),
+                                    gameState.snake.position.clone().add(gameState.snake.direction.clone().multiplyScalar(-0.1)),
+                                ];
+
+                                // NOW activate the game
+                                setGameOver(false);
+                                gameStateRef.current.gameOver = false;
+                                gameStateRef.current.spawned = true;
+                                setSpawned(true);
+                                gameStateRef.current.isRunning = true;
+
+                                console.log('[CLIENT] Spawned at server position:', myPlayer.x.toFixed(0), myPlayer.z.toFixed(0));
+                            }
+                        }, 50);
+
+                        // Timeout after 5 seconds
+                        setTimeout(() => {
+                            clearInterval(checkSpawn);
+                            console.log('[CLIENT] Spawn timeout - check server logs');
+                        }, 5000);
+                    } else {
+                        console.error('[CLIENT] No room connection!');
                     }
 
-                    // Reset game state for new spawn
-                    setGameOver(false);
-                    gameStateRef.current.gameOver = false;
-                    gameStateRef.current.spawned = true;
-                    setSpawned(true);
-                    gameStateRef.current.isRunning = true;
+                    // Don't set spawned=true yet - wait for server position!
 
                     // Reset score
                     setScore(0);
@@ -2446,10 +2507,9 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
 
                 console.log('[COLYSEUS] Connected! Session ID:', myPlayerId);
 
-                // Get initial player data (color)
-                const myPlayer = room.state.players.get(myPlayerId);
-                if (myPlayer && myPlayer.color) {
-                    const hue = parseInt(myPlayer.color.match(/\d+/)?.[0] || '0');
+                // Function to set player color
+                const setPlayerColor = (colorString: string) => {
+                    const hue = parseInt(colorString.match(/\d+/)?.[0] || '0');
                     const colorNum = new THREE.Color().setHSL(hue / 360, 0.7, 0.5).getHex();
 
                     head.traverse((child) => {
@@ -2463,53 +2523,56 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
 
                     snakeLight.color.setHex(colorNum);
                     setMyPlayerColor('#' + colorNum.toString(16).padStart(6, '0'));
-                }
+                };
 
-                // Listen for new players being added
-                (room.state.players as any).onAdd((player: Player, sessionId: string) => {
-                    console.log('[COLYSEUS] Player added:', sessionId);
-
-                    if (sessionId !== myPlayerId && player.spawned) {
-                        const position = new THREE.Vector3(player.x, player.y, player.z);
-                        const direction = new THREE.Vector3(1, 0, 0);
-
-                        const multiPlayer = createMultiplayerPlayer(
-                            sessionId,
-                            player.color,
-                            position,
-                            direction
-                        );
-                        gameState.multiplayerPlayers.set(sessionId, multiPlayer);
-                        updatePlayersOnlineCount();
+                // Wait for initial state sync before accessing player data
+                room.onStateChange.once((state) => {
+                    console.log('[COLYSEUS] Initial state synchronized');
+                    if (myPlayerId) {
+                        const myPlayer = state.players.get(myPlayerId);
+                        if (myPlayer && myPlayer.color) {
+                            setPlayerColor(myPlayer.color);
+                        }
                     }
                 });
 
-                // Listen for player state changes
-                (room.state.players as any).onChange((player: Player, sessionId: string) => {
-                    if (sessionId === myPlayerId) return; // Skip self
+                // Manually sync player updates from Colyseus state (polling approach)
+                syncInterval = setInterval(() => {
+                    if (!room || !room.state) return;
 
-                    const multiPlayer = gameState.multiplayerPlayers.get(sessionId);
+                    room.state.players.forEach((player: Player, sessionId: string) => {
+                        if (sessionId === myPlayerId) return; // Skip self
 
-                    if (player.spawned && !multiPlayer) {
-                        // Player just spawned - create them
-                        const position = new THREE.Vector3(player.x, player.y, player.z);
-                        const direction = new THREE.Vector3(1, 0, 0);
+                        const multiPlayer = gameState.multiplayerPlayers.get(sessionId);
 
-                        const newPlayer = createMultiplayerPlayer(
-                            sessionId,
-                            player.color,
-                            position,
-                            direction
-                        );
-                        gameState.multiplayerPlayers.set(sessionId, newPlayer);
-                        console.log('[COLYSEUS] Player spawned:', sessionId);
-                        updatePlayersOnlineCount();
-                    } else if (multiPlayer) {
-                        if (player.spawned) {
-                            // Update position (smooth interpolation via targetPosition)
+                        if (player.spawned && !multiPlayer) {
+                            // New player spawned - create them
+                            const position = new THREE.Vector3(player.x, player.y, player.z);
+                            const direction = new THREE.Vector3(1, 0, 0);
+
+                            const newPlayer = createMultiplayerPlayer(
+                                sessionId,
+                                player.color,
+                                position,
+                                direction
+                            );
+
+                            // Initialize trail properly to prevent long buggy trail
+                            newPlayer.trail = [
+                                position.clone(),
+                                position.clone().add(direction.clone().multiplyScalar(-0.1)),
+                            ];
+                            newPlayer.targetPosition.copy(position);
+                            newPlayer.targetDirection.copy(direction);
+
+                            gameState.multiplayerPlayers.set(sessionId, newPlayer);
+                            console.log('[COLYSEUS] Player added:', sessionId);
+                            updatePlayersOnlineCount();
+                        } else if (multiPlayer && player.spawned) {
+                            // Update existing player position
                             multiPlayer.targetPosition.set(player.x, player.y, player.z);
                             multiPlayer.length = player.length;
-                        } else {
+                        } else if (multiPlayer && !player.spawned) {
                             // Player died - remove from scene
                             scene.remove(multiPlayer.head);
                             scene.remove(multiPlayer.light);
@@ -2520,23 +2583,24 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
                             console.log('[COLYSEUS] Player died:', sessionId);
                             updatePlayersOnlineCount();
                         }
-                    }
-                });
+                    });
 
-                // Listen for players being removed (disconnect)
-                (room.state.players as any).onRemove((player: Player, sessionId: string) => {
-                    const multiPlayer = gameState.multiplayerPlayers.get(sessionId);
-                    if (multiPlayer) {
-                        scene.remove(multiPlayer.head);
-                        scene.remove(multiPlayer.light);
-                        if (multiPlayer.trailMesh) {
-                            disposeTrailMesh(multiPlayer.trailMesh);
-                        }
-                        gameState.multiplayerPlayers.delete(sessionId);
-                        console.log('[COLYSEUS] Player removed:', sessionId);
-                        updatePlayersOnlineCount();
+                    // Remove players who left
+                    if (room && room.state) {
+                        gameState.multiplayerPlayers.forEach((multiPlayer, sessionId) => {
+                            if (room && !room.state.players.has(sessionId)) {
+                                scene.remove(multiPlayer.head);
+                                scene.remove(multiPlayer.light);
+                                if (multiPlayer.trailMesh) {
+                                    disposeTrailMesh(multiPlayer.trailMesh);
+                                }
+                                gameState.multiplayerPlayers.delete(sessionId);
+                                console.log('[COLYSEUS] Player left:', sessionId);
+                                updatePlayersOnlineCount();
+                            }
+                        });
                     }
-                });
+                }, 33); // ~30Hz sync rate
 
                 updatePlayersOnlineCount();
             } catch (error) {
@@ -2566,6 +2630,11 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
             window.removeEventListener('keydown', handleKeyDown);
             window.removeEventListener('keyup', handleKeyUp);
             window.removeEventListener('resize', handleResize);
+
+            // Clear sync interval
+            if (syncInterval) {
+                clearInterval(syncInterval);
+            }
 
             // Disconnect from Colyseus room
             if (room) {
@@ -2732,6 +2801,14 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
                 ref={containerRef}
                 className={`w-full h-full cursor-pointer transition-all ${isFocused ? '' : 'opacity-70'
                     }`}
+                onClick={() => {
+                    isFocusedRef.current = true;
+                    console.log('[FOCUS] Game focused by click');
+                }}
+                onMouseEnter={() => {
+                    isFocusedRef.current = true;
+                    console.log('[FOCUS] Game focused by hover');
+                }}
             />
 
             {/* Loading Indicator */}

@@ -3,10 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "tsx --tsconfig tsconfig.server.json colyseus-server.ts",
+    "dev": "tsx colyseus-server.ts",
     "dev:next": "next dev",
     "build": "next build",
-    "start": "NODE_ENV=production tsx --tsconfig tsconfig.server.json colyseus-server.ts",
+    "start": "NODE_ENV=production tsx colyseus-server.ts",
     "docker:build": "docker build -t snake-attack .",
     "docker:run": "docker run -p 3000:3000 snake-attack",
     "docker:compose": "docker-compose up",
@@ -29,6 +29,7 @@
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
+    "@types/express": "^5.0.5",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",

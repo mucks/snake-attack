@@ -38,6 +38,8 @@ COPY --from=builder /app/.next ./.next
 COPY --from=builder /app/public ./public
 COPY --from=builder /app/colyseus-server.ts ./colyseus-server.ts
 COPY --from=builder /app/colyseus-server ./colyseus-server
+COPY --from=builder /app/tsconfig.json ./tsconfig.json
+COPY --from=builder /app/tsconfig.server.json ./tsconfig.server.json
 
 # Set production environment AFTER installing dependencies
 ENV NODE_ENV=production

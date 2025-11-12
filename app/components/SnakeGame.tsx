@@ -354,16 +354,19 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
                 if (e.code === 'Digit1' || e.code === 'Numpad1') {
                     e.preventDefault();
                     selectUpgrade(0);
+                    return;
                 }
                 if (e.code === 'Digit2' || e.code === 'Numpad2') {
                     e.preventDefault();
                     selectUpgrade(1);
+                    return;
                 }
                 if (e.code === 'Digit3' || e.code === 'Numpad3') {
                     e.preventDefault();
                     selectUpgrade(2);
+                    return;
                 }
-                return; // Don't process other keys during upgrade selection
+                // Don't return here - allow movement keys to work!
             }
 
             // Handle spawn/respawn with space

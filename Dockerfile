@@ -26,20 +26,21 @@ RUN corepack enable && corepack prepare pnpm@9.15.0 --activate
 
 WORKDIR /app
 
-# Set production environment
-ENV NODE_ENV=production
-ENV PORT=3000
-
 # Copy package files
 COPY --from=builder /app/package.json /app/pnpm-lock.yaml ./
+
+# Install ALL dependencies (including tsx which is needed to run server.ts)
+# Do this BEFORE setting NODE_ENV=production
+RUN pnpm install --frozen-lockfile
 
 # Copy built Next.js app
 COPY --from=builder /app/.next ./.next
 COPY --from=builder /app/public ./public
 COPY --from=builder /app/server.ts ./server.ts
 
-# Install ALL dependencies (including tsx which is needed to run server.ts)
-RUN pnpm install --frozen-lockfile
+# Set production environment AFTER installing dependencies
+ENV NODE_ENV=production
+ENV PORT=3000
 
 # Expose port
 EXPOSE 3000

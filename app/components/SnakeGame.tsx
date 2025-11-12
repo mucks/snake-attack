@@ -96,8 +96,18 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
     }, [showUpgradeChoice, upgradeOptions]);
 
     useEffect(() => {
-        if (!containerRef.current) return;
+        console.log('[GAME] useEffect starting...', {
+            hasContainer: !!containerRef.current,
+            containerWidth: containerRef.current?.clientWidth,
+            containerHeight: containerRef.current?.clientHeight
+        });
 
+        if (!containerRef.current) {
+            console.error('[GAME] containerRef.current is null!');
+            return;
+        }
+
+        console.log('[GAME] Initializing Three.js scene...');
         // Scene setup
         const scene = new THREE.Scene();
         scene.background = new THREE.Color(0x0a0a0a);
@@ -2407,21 +2417,20 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
         spawnObstacles(5);
 
         // Precompile shaders and warm up geometries to prevent initial lag
-        console.log('Precompiling shaders...');
+        console.log('[GAME] Precompiling shaders...');
 
-        // Use setTimeout to allow UI to render first, then compile shaders asynchronously
-        setTimeout(() => {
-            // Compile all materials and shaders by rendering the scene once before the game loop
+        // Compile all materials and shaders by rendering the scene once before the game loop
+        try {
             renderer.compile(scene, camera);
-
-            // Force an initial render to warm up GPU
             renderer.render(scene, camera);
+            console.log('[GAME] Shader compilation complete');
+        } catch (err) {
+            console.error('[GAME] Shader compilation error:', err);
+        }
 
-            console.log('Shader compilation complete');
-
-            // Mark loading as complete
-            setIsLoading(false);
-        }, 100);
+        // Mark loading as complete immediately (no setTimeout needed)
+        console.log('[GAME] Setting isLoading to false');
+        setIsLoading(false);
 
         // Set up multiplayer connection
         socket = io({

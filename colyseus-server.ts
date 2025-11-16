@@ -1,10 +1,13 @@
 import { createServer } from 'http';
-import { parse } from 'url';
 import next from 'next';
 import { Server } from 'colyseus';
 import { WebSocketTransport } from '@colyseus/ws-transport';
+import { Encoder } from '@colyseus/schema';
 import { GameRoom } from './colyseus-server/rooms/GameRoom';
 import express from 'express';
+
+// Increase buffer size for multiplayer
+Encoder.BUFFER_SIZE = 32 * 1024; // 32 KB
 
 const dev = process.env.NODE_ENV !== 'production';
 const hostname = dev ? 'localhost' : '0.0.0.0';
@@ -33,8 +36,7 @@ app.prepare().then(() => {
 
         // Start Next.js on main port
         const nextServer = createServer((req, res) => {
-            const parsedUrl = parse(req.url!, true);
-            handle(req, res, parsedUrl);
+            handle(req, res);
         });
 
         nextServer.listen(port, hostname, () => {
@@ -58,8 +60,7 @@ app.prepare().then(() => {
 
         // All routes go to Next.js
         expressApp.use((req, res) => {
-            const parsedUrl = parse(req.url!, true);
-            handle(req, res, parsedUrl);
+            handle(req, res);
         });
 
         httpServer.listen(port, hostname, () => {

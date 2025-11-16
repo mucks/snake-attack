@@ -4,34 +4,47 @@ import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { Client, Room } from 'colyseus.js';
 import type { GameState, Player } from '../../colyseus-server/schema/GameState';
-import type { UpgradeType, Upgrade, Item, Tree, Obstacle, MultiplayerPlayer } from '../game/types';
-import { AVAILABLE_UPGRADES } from '../game/upgrades';
-import {
-    WORLD_SIZE,
-    BASE_SPEED,
-    BASE_BOOST_SPEED,
-    BASE_TURN_SPEED,
-    CAMERA_FAR_PLANE,
-    FLOOR_COLOR,
-    GRID_COLOR,
-} from '../game/constants';
-import Minimap from './Minimap';
-import LoadingIndicator from './LoadingIndicator';
-import FocusIndicator from './game-ui/FocusIndicator';
-import BoostIndicator from './game-ui/BoostIndicator';
-import HUD from './game-ui/HUD';
+
+// Upgrade types
+type UpgradeType =
+    | 'speed_boost'
+    | 'turn_master'
+    | 'boost_efficiency'
+    | 'item_magnet'
+    | 'vampire'
+    | 'thick_skin'
+    | 'double_points'
+    | 'mega_boost';
+
+type Upgrade = {
+    id: UpgradeType;
+    name: string;
+    description: string;
+    icon: string;
+};
+
+const AVAILABLE_UPGRADES: Upgrade[] = [
+    { id: 'speed_boost', name: 'Speed Demon', description: '+30% Base Speed', icon: '⚡' },
+    { id: 'turn_master', name: 'Turn Master', description: '+50% Turn Speed', icon: '🌀' },
+    { id: 'boost_efficiency', name: 'Efficient Boost', description: 'Boost costs 50% less', icon: '💨' },
+    { id: 'item_magnet', name: 'Item Magnet', description: '2x Collection Range', icon: '🧲' },
+    { id: 'vampire', name: 'Vampire', description: 'Gain 20% of killed snake length', icon: '🧛' },
+    { id: 'thick_skin', name: 'Thick Skin', description: '1 Free Death (Shield)', icon: '🛡️' },
+    { id: 'double_points', name: 'Double Points', description: '2x Score from items', icon: '💰' },
+    { id: 'mega_boost', name: 'Mega Boost', description: '2x Boost Speed', icon: '🚀' },
+];
 
 export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
     const containerRef = useRef<HTMLDivElement>(null);
+    const minimapCanvasRef = useRef<HTMLCanvasElement>(null);
     const [score, setScore] = useState(0);
+    const [itemsCollected, setItemsCollected] = useState(0);
     const [gameOver, setGameOver] = useState(false);
     const [playersOnline, setPlayersOnline] = useState(1);
     const [isBoosting, setIsBoosting] = useState(false);
-    const [playerLength, setPlayerLength] = useState(10);
     const [fps, setFps] = useState(60);
     const [myPlayerColor, setMyPlayerColor] = useState('#00ffff');
     const [spawned, setSpawned] = useState(false);
-    const spawnTimeRef = useRef<number>(0); // Track when player spawned for grace period
     const [leaderboard, setLeaderboard] = useState<Array<{ name: string; length: number; isMe: boolean; color: string }>>([]);
     const [isLoading, setIsLoading] = useState(true);
     const [level, setLevel] = useState(0);
@@ -41,8 +54,6 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
     const showUpgradeChoiceRef = useRef(false);
     const upgradeOptionsRef = useRef<Upgrade[]>([]);
     const isFocusedRef = useRef(false);
-    const roomRef = useRef<Room<GameState> | null>(null);
-    const previousLengthRef = useRef<number>(10); // Track previous length to detect mass loss
     const minimapDataRef = useRef<{
         playerPos: { x: number; z: number };
         playerDirection: { x: number; z: number };
@@ -73,12 +84,6 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
             if (upgrade.id === 'thick_skin') {
                 gameStateRef.current.hasShield = true;
             }
-
-            // Send upgrade selection to server
-            if (roomRef.current) {
-                roomRef.current.send('select-upgrade', { upgrade: upgrade.id });
-            }
-
             setShowUpgradeChoice(false);
             showUpgradeChoiceRef.current = false;
         }
@@ -124,7 +129,7 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
             75,
             containerWidth / containerHeight,
             0.1,
-            CAMERA_FAR_PLANE
+            500 // Increased to match culling distance and show distant players/bots
         );
 
         // Renderer setup with aggressive performance optimizations for Safari
@@ -169,16 +174,16 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
         scene.add(snakeLight);
 
         // Create grid floor - optimized world size
-        const gridSize = WORLD_SIZE * 2;
+        const gridSize = 1000; // Reduced for better gameplay density
         const gridDivisions = 100;
-        const gridHelper = new THREE.GridHelper(gridSize, gridDivisions, GRID_COLOR, GRID_COLOR);
+        const gridHelper = new THREE.GridHelper(gridSize, gridDivisions, 0x00ffff, 0x003333);
         gridHelper.position.y = -0.5;
         scene.add(gridHelper);
 
         // Add glowing floor plane with subtle gradient
         const floorGeometry = new THREE.PlaneGeometry(gridSize, gridSize);
         const floorMaterial = new THREE.MeshStandardMaterial({
-            color: FLOOR_COLOR,
+            color: 0x000000,
             transparent: true,
             opacity: 0.9,
             emissive: 0x001a1a,
@@ -189,19 +194,59 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
         floor.position.y = -0.51;
         scene.add(floor);
 
+        // Item type with rarity and value support
+        type Item = {
+            position: THREE.Vector3;
+            mesh: THREE.Mesh;
+            spawnTime: number;
+            type: 'common' | 'uncommon' | 'rare' | 'epic' | 'treasure';
+            value: number;
+        };
+
+        // Tree type
+        type Tree = {
+            position: THREE.Vector3;
+            group: THREE.Group;
+        };
+
+        // Obstacle type
+        type Obstacle = {
+            position: THREE.Vector3;
+            mesh: THREE.Mesh | THREE.Group;
+            radius: number;
+        };
+
+        // Multiplayer player type
+        type MultiplayerPlayer = {
+            id: string;
+            position: THREE.Vector3;
+            targetPosition: THREE.Vector3; // For smooth interpolation
+            direction: THREE.Vector3;
+            targetDirection: THREE.Vector3; // For smooth interpolation
+            head: THREE.Group;
+            trail: THREE.Vector3[]; // Synced from server, never built client-side
+            trailMesh: THREE.Mesh | null; // Legacy tube mesh (deprecated)
+            trailSegments?: THREE.Group; // New slither.io-style sphere chain
+            light: THREE.PointLight;
+            length: number;
+            color: string;
+            lastRenderedTrailLength?: number; // Track when we last updated mesh
+            lastMeshUpdateTime?: number; // TIME-based update tracking (milliseconds)
+        };
+
         // Game state
         const gameState = {
             snake: {
                 position: new THREE.Vector3(0, 0.5, 0),
                 direction: new THREE.Vector3(0, 0, -1),
-                speed: BASE_SPEED,
-                baseSpeed: BASE_SPEED,
-                boostSpeed: BASE_BOOST_SPEED,
-                turnSpeed: BASE_TURN_SPEED,
+                speed: 0.3,
+                baseSpeed: 0.3,
+                boostSpeed: 0.6,
+                turnSpeed: 0.05,
                 segments: [] as (THREE.Mesh | THREE.Group)[],
-                tail: [] as THREE.Vector3[], // Server-authoritative tail segments
-                tailMesh: null as THREE.Mesh | THREE.Group | null,
-                length: 10, // Current trail length - start with visible body (server-authoritative)
+                trail: [] as THREE.Vector3[],
+                trailMesh: null as THREE.Mesh | null,
+                length: 20, // Current trail length - start with visible body
                 boosting: false,
                 boostCostTimer: 0,
                 spawnFrameCount: 0, // Track frames since spawn to delay trail rendering
@@ -372,13 +417,17 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
                                 gameState.snake.position.set(myPlayer.x, myPlayer.y, myPlayer.z);
                                 head.position.copy(gameState.snake.position);
 
+                                // Initialize trail properly to prevent buggy long trail
+                                gameState.snake.trail = [
+                                    gameState.snake.position.clone(),
+                                    gameState.snake.position.clone().add(gameState.snake.direction.clone().multiplyScalar(-0.1)),
+                                ];
 
                                 // NOW activate the game
                                 setGameOver(false);
                                 gameStateRef.current.gameOver = false;
                                 gameStateRef.current.spawned = true;
                                 setSpawned(true);
-                                spawnTimeRef.current = Date.now(); // Record spawn time for grace period
                                 gameStateRef.current.isRunning = true;
 
                                 console.log('[CLIENT] Spawned at server position:', myPlayer.x.toFixed(0), myPlayer.z.toFixed(0));
@@ -399,6 +448,7 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
                     // Reset score
                     setScore(0);
                     gameStateRef.current.score = 0;
+                    setItemsCollected(0);
 
                     // Reset upgrades and level
                     setLevel(0);
@@ -407,8 +457,12 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
                     gameStateRef.current.hasShield = false;
 
                     // Reset snake state
-                    gameState.snake.length = 10; // Server will set authoritative length
-                    setPlayerLength(10);
+                    gameState.snake.length = 20;
+                    // Initialize trail with just 2 close points - will build naturally as snake moves
+                    gameState.snake.trail = [
+                        gameState.snake.position.clone(),
+                        gameState.snake.position.clone().sub(gameState.snake.direction.clone().multiplyScalar(0.1)),
+                    ];
                     gameState.snake.boosting = false;
                     gameState.snake.spawnFrameCount = 0; // Reset spawn frame counter
 
@@ -427,14 +481,7 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
                 gameState.keys.right = true;
             }
             if (e.code === 'KeyW' || e.key === 'ArrowUp') {
-                // Only allow boost if player has enough mass (must be > 30, not >= 30)
-                const MIN_BOOST_LENGTH = 30;
-                if (gameState.snake.length > MIN_BOOST_LENGTH) {
-                    gameState.keys.boost = true;
-                } else {
-                    // Block boost input if too short
-                    gameState.keys.boost = false;
-                }
+                gameState.keys.boost = true;
             }
         };
 
@@ -457,6 +504,191 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
         window.addEventListener('keydown', handleKeyDown);
         window.addEventListener('keyup', handleKeyUp);
 
+        // Helper function to dispose trail mesh (which is now a Group containing tube + caps)
+        const disposeTrailMesh = (trailMesh: any) => {
+            if (!trailMesh) return;
+
+            try {
+                // CRITICAL: Remove from scene FIRST and IMMEDIATELY
+                if (trailMesh.parent) {
+                    trailMesh.parent.remove(trailMesh);
+                }
+                scene.remove(trailMesh);
+
+                // Force visibility off to prevent any rendering
+                trailMesh.visible = false;
+
+                // Traverse and dispose all geometries and materials in the group
+                if (trailMesh.traverse && typeof trailMesh.traverse === 'function') {
+                    trailMesh.traverse((child: any) => {
+                        if (!child) return;
+
+                        // Force visibility off for all children
+                        child.visible = false;
+
+                        if (child instanceof THREE.Mesh) {
+                            if (child.geometry) {
+                                child.geometry.dispose();
+                            }
+                            if (child.material) {
+                                if (Array.isArray(child.material)) {
+                                    child.material.forEach((mat: any) => mat?.dispose?.());
+                                } else {
+                                    child.material.dispose();
+                                }
+                            }
+                        }
+                    });
+                }
+            } catch (error) {
+                console.error('Error disposing trail mesh:', error);
+            }
+        };
+
+        // Create trail mesh function with LOD (Level of Detail)
+        const updateTrailMesh = (trail: THREE.Vector3[], currentMesh: THREE.Mesh | null, color: number, lowDetail: boolean = false): THREE.Mesh | null => {
+            if (trail.length < 2) return currentMesh;
+
+            // Validate trail points - filter out any invalid points
+            const validTrail = trail.filter(p => {
+                if (!p) return false;
+                if (typeof p.x !== 'number' || typeof p.y !== 'number' || typeof p.z !== 'number') return false;
+                if (isNaN(p.x) || isNaN(p.y) || isNaN(p.z)) return false;
+                if (!isFinite(p.x) || !isFinite(p.y) || !isFinite(p.z)) return false;
+                return true;
+            });
+
+            // Remove duplicate consecutive points (can cause curve issues)
+            // IMPORTANT: Always keep at least first and last point
+            const uniqueTrail: THREE.Vector3[] = [];
+            for (let i = 0; i < validTrail.length; i++) {
+                // Always include first point, last point, or points with sufficient distance
+                if (i === 0 || i === validTrail.length - 1 || validTrail[i].distanceTo(validTrail[i - 1]) > 0.01) {
+                    uniqueTrail.push(validTrail[i]);
+                }
+            }
+
+            // If validation removed too many points, keep the current mesh
+            if (uniqueTrail.length < 2) {
+                // Don't dispose the current mesh, just return it to keep the trail visible
+                return currentMesh;
+            }
+
+            try {
+                // Final validation: ensure all points are proper Vector3 instances with valid properties
+                for (let i = 0; i < uniqueTrail.length; i++) {
+                    const point = uniqueTrail[i];
+                    if (!point || !(point instanceof THREE.Vector3) ||
+                        typeof point.x !== 'number' || typeof point.y !== 'number' || typeof point.z !== 'number' ||
+                        !isFinite(point.x) || !isFinite(point.y) || !isFinite(point.z)) {
+                        console.error('Invalid point in uniqueTrail at index', i, point);
+                        return currentMesh; // Keep current mesh if any point is invalid
+                    }
+                }
+
+                // Create curve - use simpler curve for short trails to avoid CatmullRom issues
+                let curve;
+                if (uniqueTrail.length === 2) {
+                    // For 2 points, use a simple LineCurve3 to avoid CatmullRom interpolation issues
+                    curve = new THREE.LineCurve3(uniqueTrail[0], uniqueTrail[1]);
+                } else if (uniqueTrail.length === 3) {
+                    // For 3 points, use QuadraticBezierCurve3 for smooth interpolation
+                    curve = new THREE.QuadraticBezierCurve3(uniqueTrail[0], uniqueTrail[1], uniqueTrail[2]);
+                } else {
+                    // For 4+ points, use CatmullRomCurve3 for very smooth curves
+                    curve = new THREE.CatmullRomCurve3(uniqueTrail, false, 'catmullrom', 0.3);
+                }
+
+                // Verify curve was created successfully and can sample points
+                if (!curve || !curve.getPoint) {
+                    console.error('Failed to create valid curve');
+                    return currentMesh;
+                }
+
+                // Test that the curve can actually return valid points at multiple samples
+                try {
+                    const samples = [0, 0.5, 1];
+                    for (const t of samples) {
+                        const testPoint = curve.getPoint(t);
+                        if (!testPoint || typeof testPoint.x !== 'number' || !isFinite(testPoint.x) ||
+                            !isFinite(testPoint.y) || !isFinite(testPoint.z)) {
+                            console.error(`Curve getPoint(${t}) returned invalid data:`, testPoint);
+                            return currentMesh;
+                        }
+                    }
+                } catch (e) {
+                    console.error('curve.getPoint threw error:', e, 'Trail length:', uniqueTrail.length);
+                    return currentMesh;
+                }
+
+                // Balanced for performance with many bots - ensure minimum of 3 segments for TubeGeometry
+                const tubularSegments = Math.max(
+                    lowDetail ? Math.max(uniqueTrail.length, 20) : Math.max(uniqueTrail.length * 1.5, 30),
+                    3
+                );
+                const radialSegments = lowDetail ? 5 : 7;
+
+                // Additional safety: ensure segments are valid numbers
+                if (!isFinite(tubularSegments) || !isFinite(radialSegments) || tubularSegments < 3 || radialSegments < 3) {
+                    console.error('Invalid geometry segments:', tubularSegments, radialSegments);
+                    return currentMesh;
+                }
+
+                let tubeGeometry;
+                try {
+                    tubeGeometry = new THREE.TubeGeometry(curve, Math.floor(tubularSegments), 0.4, Math.floor(radialSegments), false);
+
+                    // Verify geometry was created with valid attributes
+                    if (!tubeGeometry || !tubeGeometry.attributes || !tubeGeometry.attributes.position) {
+                        console.error('TubeGeometry created but has invalid attributes');
+                        return currentMesh;
+                    }
+                } catch (geometryError) {
+                    console.error('TubeGeometry creation failed:', geometryError, 'Trail points:', uniqueTrail.length, 'Curve type:', curve.type);
+                    return currentMesh;
+                }
+
+                const trailMaterial = new THREE.MeshStandardMaterial({
+                    color: color,
+                    emissive: color,
+                    emissiveIntensity: 0.5,
+                    metalness: 0.8,
+                    roughness: 0.2,
+                });
+
+                // Create a group to hold the tube and caps
+                const trailGroup = new THREE.Group();
+
+                const tubeMesh = new THREE.Mesh(tubeGeometry, trailMaterial);
+                trailGroup.add(tubeMesh);
+
+                // Add spherical caps at both ends of the trail for a polished look
+                const capGeometry = new THREE.SphereGeometry(0.4, radialSegments, radialSegments);
+
+                // Cap at the start (tail end) of the trail
+                const startCap = new THREE.Mesh(capGeometry, trailMaterial);
+                startCap.position.copy(uniqueTrail[uniqueTrail.length - 1]);
+                trailGroup.add(startCap);
+
+                // Cap at the end (head end) of the trail
+                const endCap = new THREE.Mesh(capGeometry, trailMaterial);
+                endCap.position.copy(uniqueTrail[0]);
+                trailGroup.add(endCap);
+
+                // CRITICAL: Dispose old mesh BEFORE adding new one to prevent double trails
+                if (currentMesh) {
+                    disposeTrailMesh(currentMesh);
+                }
+
+                scene.add(trailGroup);
+
+                return trailGroup as any;
+            } catch (error) {
+                console.error('Error creating trail mesh:', error, 'Trail length:', uniqueTrail.length);
+                // Keep the current mesh if creation fails
+                return currentMesh;
+            }
+        };
 
         const updatePlayersOnlineCount = () => {
             const realPlayerCount = gameState.multiplayerPlayers.size + (gameStateRef.current.spawned ? 1 : 0);
@@ -580,22 +812,33 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
         };
 
         // Create a complete fractal tree
-        const createFractalTree = (position: THREE.Vector3, color?: number, height?: number): Tree => {
+        const createFractalTree = (position: THREE.Vector3): Tree => {
             const group = new THREE.Group();
 
-            // Use provided color or default to magenta
-            const treeColor = color !== undefined ? new THREE.Color(color) : new THREE.Color(0xff00ff);
-            const treeHeight = height !== undefined ? height : (6 + Math.random() * 4);
+            // Random tree color variations - brighter colors
+            const colorOptions = [
+                new THREE.Color(0xff00ff), // Magenta
+                new THREE.Color(0x00ffff), // Cyan
+                new THREE.Color(0xff0088), // Pink
+                new THREE.Color(0x88ff00), // Lime
+                new THREE.Color(0xff8800), // Orange
+                new THREE.Color(0x0088ff), // Blue
+                new THREE.Color(0x8800ff), // Purple
+                new THREE.Color(0xffff00), // Yellow
+            ];
+
+            const color = colorOptions[Math.floor(Math.random() * colorOptions.length)];
+            const height = 6 + Math.random() * 4; // Shorter trees
             const initialDirection = new THREE.Vector3(0, 1, 0);
 
             // Create trunk and branches
             createFractalBranch(
                 new THREE.Vector3(0, 0, 0),
                 initialDirection,
-                treeHeight,
+                height,
                 0.5, // Medium thickness
                 4, // Recursion depth
-                treeColor,
+                color,
                 group
             );
 
@@ -677,113 +920,6 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
         };
 
         // Create multiplayer player
-        // Helper function to dispose tail mesh (handles both Mesh and Group)
-        const disposeTailMesh = (tailMesh: THREE.Mesh | THREE.Group | null) => {
-            if (!tailMesh) return;
-            scene.remove(tailMesh);
-            if (tailMesh instanceof THREE.Group) {
-                tailMesh.traverse((child) => {
-                    if (child instanceof THREE.Mesh) {
-                        child.geometry.dispose();
-                        if (child.material) (child.material as THREE.Material).dispose();
-                    }
-                });
-            } else if (tailMesh instanceof THREE.Mesh) {
-                tailMesh.geometry.dispose();
-                if (tailMesh.material) (tailMesh.material as THREE.Material).dispose();
-            }
-        };
-
-        // Helper function to update multiplayer player tail mesh
-        const updateMultiplayerTailMesh = (player: MultiplayerPlayer, tail: THREE.Vector3[], currentMesh: THREE.Mesh | THREE.Group | null, headColor: string | number): THREE.Mesh | THREE.Group | null => {
-            if (tail.length < 1) {
-                // No tail segments, remove mesh if exists
-                disposeTailMesh(currentMesh);
-                return null;
-            }
-
-            try {
-                // Create a curve from tail points (head position + tail segments)
-                const points: THREE.Vector3[] = [player.position, ...tail];
-
-                // Filter out invalid points
-                const validPoints = points.filter(p =>
-                    p &&
-                    typeof p.x === 'number' &&
-                    typeof p.y === 'number' &&
-                    typeof p.z === 'number' &&
-                    isFinite(p.x) &&
-                    isFinite(p.y) &&
-                    isFinite(p.z)
-                );
-
-                if (validPoints.length < 2) {
-                    return currentMesh; // Keep current mesh if not enough points
-                }
-
-                // Create curve
-                let curve: THREE.Curve<THREE.Vector3>;
-                if (validPoints.length === 2) {
-                    curve = new THREE.LineCurve3(validPoints[0], validPoints[1]);
-                } else if (validPoints.length === 3) {
-                    curve = new THREE.QuadraticBezierCurve3(validPoints[0], validPoints[1], validPoints[2]);
-                } else {
-                    curve = new THREE.CatmullRomCurve3(validPoints, false, 'catmullrom', 0.3);
-                }
-
-                // Create tube geometry
-                const tubularSegments = Math.max(validPoints.length * 2, 20);
-                const radialSegments = 8;
-                const radius = 0.4;
-
-                const tubeGeometry = new THREE.TubeGeometry(curve, tubularSegments, radius, radialSegments, false);
-
-                // Parse color from string (hsl or hex)
-                let colorNum = 0xff00ff;
-                if (headColor.toString().startsWith('hsl')) {
-                    const hue = parseInt(headColor.toString().match(/\d+/)?.[0] || '0');
-                    colorNum = new THREE.Color().setHSL(hue / 360, 0.7, 0.5).getHex();
-                } else if (typeof headColor === 'string') {
-                    colorNum = parseInt(headColor.replace('#', ''), 16) || 0xff00ff;
-                } else {
-                    colorNum = headColor;
-                }
-
-                // Create material with player color
-                const tailMaterial = new THREE.MeshStandardMaterial({
-                    color: colorNum,
-                    emissive: colorNum,
-                    emissiveIntensity: 0.5,
-                    metalness: 0.8,
-                    roughness: 0.2,
-                });
-
-                // Dispose old mesh/group
-                disposeTailMesh(currentMesh);
-
-                // Create group to hold tube and tail cap
-                const tailGroup = new THREE.Group();
-
-                // Create tube mesh
-                const tubeMesh = new THREE.Mesh(tubeGeometry, tailMaterial);
-                tailGroup.add(tubeMesh);
-
-                // Add sphere cap at tail end to close the hole
-                const tailEndPosition = validPoints[validPoints.length - 1]; // Last point is the tail end
-                const capGeometry = new THREE.SphereGeometry(radius, radialSegments, radialSegments);
-                const tailCap = new THREE.Mesh(capGeometry, tailMaterial);
-                tailCap.position.copy(tailEndPosition);
-                tailGroup.add(tailCap);
-
-                scene.add(tailGroup);
-
-                return tailGroup as any;
-            } catch (error) {
-                console.error('Error updating multiplayer tail mesh:', error);
-                return currentMesh; // Keep current mesh on error
-            }
-        };
-
         const createMultiplayerPlayer = (id: string, color: string, position?: any, direction?: any): MultiplayerPlayer => {
             // Parse HSL color to hex
             let colorNum = 0xff00ff;
@@ -810,6 +946,8 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
             const playerLight = new THREE.PointLight(colorNum, 2, 30);
             scene.add(playerLight);
 
+            // Initialize trail with multiple points spread behind the head for natural appearance
+            const backDir = spawnDir.clone().multiplyScalar(-1);
             return {
                 id,
                 position: spawnPos,
@@ -817,10 +955,15 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
                 direction: spawnDir,
                 targetDirection: spawnDir.clone(),
                 head: playerHead,
-                tail: [] as THREE.Vector3[],
-                tailMesh: null as THREE.Mesh | null,
+                trail: [
+                    spawnPos.clone(),
+                    spawnPos.clone().add(backDir.clone().multiplyScalar(0.8)),
+                    spawnPos.clone().add(backDir.clone().multiplyScalar(1.6)),
+                    spawnPos.clone().add(backDir.clone().multiplyScalar(2.4)),
+                ],
+                trailMesh: null,
                 light: playerLight,
-                length: 10, // Server-authoritative, will be synced from server
+                length: 20,
                 color,
             };
         };
@@ -866,26 +1009,14 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
 
                     gameState.snake.length += growthAmount;
 
-                    // Score determines length - increase score when collecting items
+                    // Update score based on item value
                     const pointMultiplier = activeUpgrades.includes('double_points') ? 2 : 1;
-                    const scoreIncrease = item.value * 10 * pointMultiplier;
-                    gameStateRef.current.score += scoreIncrease;
-                    const newScore = gameStateRef.current.score;
-                    setScore(newScore);
+                    gameStateRef.current.score += item.value * 10 * pointMultiplier;
+                    setScore(gameStateRef.current.score);
+                    setItemsCollected(prev => prev + 1);
 
-                    // Notify server of growth (server is authoritative for length)
-                    // Score determines length, so send new score as length
-                    // Include itemId if available (for maze treasures)
-                    if (room) {
-                        const message: any = { length: newScore }; // Score = length
-                        if (item.id) {
-                            message.itemId = item.id;
-                        }
-                        room.send('player-grow', message);
-                    }
-
-                    // Check for level up (every 50 score = 1 level)
-                    const newLevel = Math.floor(newScore / 50);
+                    // Check for level up (every 50 length = 1 level)
+                    const newLevel = Math.floor(gameState.snake.length / 50);
                     if (newLevel > gameStateRef.current.lastLevelUp) {
                         gameStateRef.current.lastLevelUp = newLevel;
                         setLevel(newLevel);
@@ -919,8 +1050,8 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
             );
         };
 
-        // Check collision - optimized
-        const checkCollision = (position: THREE.Vector3) => {
+        // Check collision with trail (slither.io style) - optimized
+        const checkCollision = (position: THREE.Vector3, skipTrailCount: number = 10, ownTrail?: THREE.Vector3[]) => {
             // Check boundaries
             const boundary = gridSize / 2 - 2;
             if (
@@ -963,6 +1094,18 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
                 }
             }
 
+            // Check player trail collision - sample every 3rd point for better performance (Safari)
+            const playerTrailToCheck = ownTrail === gameState.snake.trail
+                ? gameState.snake.trail.slice(0, -skipTrailCount)
+                : gameState.snake.trail;
+
+            for (let i = 0; i < playerTrailToCheck.length; i += 3) { // Skip every 3rd point for Safari
+                const segment = playerTrailToCheck[i];
+                const distanceSq = position.distanceToSquared(segment);
+                if (distanceSq < collisionDistanceSq) {
+                    return true;
+                }
+            }
 
             // Check multiplayer players' head positions first (important for close encounters)
             const headCollisionDistance = 2.5;
@@ -975,136 +1118,23 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
                     return true;
                 }
 
+                // Check trail collision
+                const playerTrailToCheck = ownTrail === player.trail
+                    ? player.trail.slice(0, -skipTrailCount)
+                    : player.trail;
+
+                for (let i = 0; i < playerTrailToCheck.length; i += 2) {
+                    const segment = playerTrailToCheck[i];
+                    const distanceSq = position.distanceToSquared(segment);
+                    if (distanceSq < collisionDistanceSq) {
+                        return true;
+                    }
+                }
             }
 
             return false;
         };
 
-        // Helper function to update tail mesh from server-authoritative tail data
-        const updateTailMesh = (tail: THREE.Vector3[], currentMesh: THREE.Mesh | THREE.Group | null, headColor: number): THREE.Mesh | THREE.Group | null => {
-            if (tail.length < 1) {
-                // No tail segments, remove mesh if exists
-                disposeTailMesh(currentMesh);
-                return null;
-            }
-
-            try {
-                // Create a curve from tail points (head position + tail segments)
-                const points: THREE.Vector3[] = [gameState.snake.position, ...tail];
-
-                // Filter out invalid points
-                const validPoints = points.filter(p =>
-                    p &&
-                    typeof p.x === 'number' &&
-                    typeof p.y === 'number' &&
-                    typeof p.z === 'number' &&
-                    isFinite(p.x) &&
-                    isFinite(p.y) &&
-                    isFinite(p.z)
-                );
-
-                if (validPoints.length < 2) {
-                    return currentMesh; // Keep current mesh if not enough points
-                }
-
-                // Create curve
-                let curve: THREE.Curve<THREE.Vector3>;
-                if (validPoints.length === 2) {
-                    curve = new THREE.LineCurve3(validPoints[0], validPoints[1]);
-                } else if (validPoints.length === 3) {
-                    curve = new THREE.QuadraticBezierCurve3(validPoints[0], validPoints[1], validPoints[2]);
-                } else {
-                    curve = new THREE.CatmullRomCurve3(validPoints, false, 'catmullrom', 0.3);
-                }
-
-                // Create tube geometry
-                const tubularSegments = Math.max(validPoints.length * 2, 20);
-                const radialSegments = 8;
-                const radius = 0.4;
-
-                const tubeGeometry = new THREE.TubeGeometry(curve, tubularSegments, radius, radialSegments, false);
-
-                // Create material with head color
-                const tailMaterial = new THREE.MeshStandardMaterial({
-                    color: headColor,
-                    emissive: headColor,
-                    emissiveIntensity: 0.5,
-                    metalness: 0.8,
-                    roughness: 0.2,
-                });
-
-                // Dispose old mesh/group
-                disposeTailMesh(currentMesh);
-
-                // Create group to hold tube and tail cap
-                const tailGroup = new THREE.Group();
-
-                // Create tube mesh
-                const tubeMesh = new THREE.Mesh(tubeGeometry, tailMaterial);
-                tailGroup.add(tubeMesh);
-
-                // Add sphere cap at tail end to close the hole
-                const tailEndPosition = validPoints[validPoints.length - 1]; // Last point is the tail end
-                const capGeometry = new THREE.SphereGeometry(radius, radialSegments, radialSegments);
-                const tailCap = new THREE.Mesh(capGeometry, tailMaterial);
-                tailCap.position.copy(tailEndPosition);
-                tailGroup.add(tailCap);
-
-                scene.add(tailGroup);
-
-                return tailGroup as any;
-            } catch (error) {
-                console.error('Error updating tail mesh:', error);
-                return currentMesh; // Keep current mesh on error
-            }
-        };
-
-        // Shared geometries and materials for items (CRITICAL for performance!)
-        const itemGeometries = {
-            common: new THREE.OctahedronGeometry(0.4, 0),
-            uncommon: new THREE.OctahedronGeometry(0.5, 0),
-            rare: new THREE.OctahedronGeometry(0.6, 0),
-            epic: new THREE.OctahedronGeometry(0.7, 0),
-            treasure: new THREE.OctahedronGeometry(1.0, 1),
-        };
-
-        const itemMaterials = {
-            common: new THREE.MeshStandardMaterial({
-                color: 0xffff00,
-                emissive: 0xffff00,
-                emissiveIntensity: 0.8,
-                metalness: 0.8,
-                roughness: 0.2,
-            }),
-            uncommon: new THREE.MeshStandardMaterial({
-                color: 0x00ff00,
-                emissive: 0x00ff00,
-                emissiveIntensity: 1.0,
-                metalness: 0.8,
-                roughness: 0.2,
-            }),
-            rare: new THREE.MeshStandardMaterial({
-                color: 0x0088ff,
-                emissive: 0x0088ff,
-                emissiveIntensity: 1.2,
-                metalness: 0.8,
-                roughness: 0.2,
-            }),
-            epic: new THREE.MeshStandardMaterial({
-                color: 0xff00ff,
-                emissive: 0xff00ff,
-                emissiveIntensity: 1.5,
-                metalness: 0.8,
-                roughness: 0.2,
-            }),
-            treasure: new THREE.MeshStandardMaterial({
-                color: 0xffd700,
-                emissive: 0xffd700,
-                emissiveIntensity: 2.0,
-                metalness: 1.0,
-                roughness: 0.1,
-            }),
-        };
 
         // Animation loop with FPS tracking
         let lastTime = Date.now();
@@ -1126,49 +1156,83 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
                 fpsUpdateTime = currentTime;
             }
 
-            // Update head visibility based on spawn state
+            // Update head and trail visibility based on spawn state
             head.visible = gameStateRef.current.spawned && !gameStateRef.current.gameOver;
             snakeLight.visible = gameStateRef.current.spawned && !gameStateRef.current.gameOver;
+            if (gameState.snake.trailMesh) {
+                gameState.snake.trailMesh.visible = gameStateRef.current.spawned && !gameStateRef.current.gameOver;
+            }
 
             if (!gameStateRef.current.gameOver && gameStateRef.current.isRunning && gameStateRef.current.spawned) {
-                // Server is authoritative for movement - we only handle visuals here
-                // Movement is calculated on the server based on input commands we send
+                // Apply upgrades to base stats
+                const speedMultiplier = activeUpgrades.includes('speed_boost') ? 1.3 : 1.0;
+                const turnMultiplier = activeUpgrades.includes('turn_master') ? 1.5 : 1.0;
+                const boostSpeedMultiplier = activeUpgrades.includes('mega_boost') ? 2.0 : 1.0;
+                const boostCostMultiplier = activeUpgrades.includes('boost_efficiency') ? 0.5 : 1.0;
 
-                // Apply visual effects based on server state
-                if (gameState.snake.boosting) {
-                    // Boost visual: brighter emissive and pulsing effect to show mass loss
-                    const pulseIntensity = 1.0 + Math.sin(Date.now() * 0.01) * 0.3; // Pulsing effect
+                gameState.snake.baseSpeed = 0.3 * speedMultiplier;
+                gameState.snake.turnSpeed = 0.05 * turnMultiplier;
+                gameState.snake.boostSpeed = 0.6 * boostSpeedMultiplier;
+
+                // Handle boosting
+                const minBoostLength = 15;
+                if (gameState.keys.boost && gameState.snake.length > minBoostLength) {
+                    gameState.snake.boosting = true;
+                    gameState.snake.speed = gameState.snake.boostSpeed;
+                    setIsBoosting(true);
+
+                    // Consume body length while boosting (with efficiency upgrade)
+                    gameState.snake.boostCostTimer += deltaTime;
+                    if (gameState.snake.boostCostTimer >= 2) {
+                        const costAmount = 0.15 * boostCostMultiplier;
+                        gameState.snake.length = Math.max(minBoostLength, gameState.snake.length - costAmount);
+                        gameState.snake.boostCostTimer = 0;
+                    }
+
+                    // Boost visual: brighter emissive
                     head.traverse((child) => {
                         if (child instanceof THREE.Mesh && child.material instanceof THREE.MeshStandardMaterial) {
-                            child.material.emissiveIntensity = pulseIntensity;
-                            // Add orange/yellow tint when boosting to show mass burning
-                            const baseColor = child.material.color.clone();
-                            const boostColor = baseColor.lerp(new THREE.Color(0xff6600), 0.4); // Orange tint
-                            child.material.color.copy(boostColor);
+                            child.material.emissiveIntensity = 1.0;
                         }
                     });
-                    snakeLight.intensity = 3 + Math.sin(Date.now() * 0.01) * 0.5; // Pulsing light
-                    snakeLight.color.setHex(0xff6600); // Orange light when boosting
+                    snakeLight.intensity = 3;
                 } else {
+                    gameState.snake.boosting = false;
+                    gameState.snake.speed = gameState.snake.baseSpeed;
+                    setIsBoosting(false);
                     head.traverse((child) => {
                         if (child instanceof THREE.Mesh && child.material instanceof THREE.MeshStandardMaterial) {
                             child.material.emissiveIntensity = 0.5;
-                            // Reset to original color
-                            const originalColor = new THREE.Color(0x00ffff); // Default cyan
-                            child.material.color.copy(originalColor);
                         }
                     });
                     snakeLight.intensity = 2;
-                    snakeLight.color.setHex(0x00ffff); // Cyan light when not boosting
                 }
 
-                // Position and direction are synced from server (see sync code below)
-                // We only update visuals here, not movement logic
+                // Handle turning
+                if (gameState.keys.left) {
+                    const axis = new THREE.Vector3(0, 1, 0);
+                    gameState.snake.direction.applyAxisAngle(axis, gameState.snake.turnSpeed * deltaTime);
+                    gameState.snake.direction.normalize();
+                }
+                if (gameState.keys.right) {
+                    const axis = new THREE.Vector3(0, 1, 0);
+                    gameState.snake.direction.applyAxisAngle(axis, -gameState.snake.turnSpeed * deltaTime);
+                    gameState.snake.direction.normalize();
+                }
 
-                // Check collision (skip collision check during spawn grace period - 1 second after spawn)
-                const timeSinceSpawn = Date.now() - spawnTimeRef.current;
-                const spawnGracePeriod = 1000; // 1 second grace period after spawn
-                if (timeSinceSpawn > spawnGracePeriod && checkCollision(gameState.snake.position)) {
+                // Move snake forward
+                const movement = gameState.snake.direction.clone().multiplyScalar(gameState.snake.speed * deltaTime);
+                gameState.snake.position.add(movement);
+
+                // Sanitize position to prevent NaN/Infinity corruption
+                if (!isFinite(gameState.snake.position.x) || !isFinite(gameState.snake.position.y) || !isFinite(gameState.snake.position.z)) {
+                    console.error('Snake position became invalid, resetting:', gameState.snake.position);
+                    gameState.snake.position.set(0, 0.5, 0);
+                    gameState.snake.direction.set(0, 0, -1);
+                }
+
+                // Check collision
+                if (checkCollision(gameState.snake.position, 10, gameState.snake.trail)) {
                     // Check if player has shield upgrade
                     if (gameStateRef.current.hasShield) {
                         console.log('[CLIENT] Shield absorbed hit!');
@@ -1188,6 +1252,7 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
                     }
 
                     console.log('[CLIENT] ===== I DIED! =====');
+                    console.log('[CLIENT] My trail length:', gameState.snake.trail.length);
                     console.log('[CLIENT] My player ID:', myPlayerId);
 
                     setGameOver(true);
@@ -1196,10 +1261,24 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
                     gameStateRef.current.spawned = false;
                     setSpawned(false);
 
+                    // Save trail data before clearing
+                    const trailData = gameState.snake.trail.map(p => ({ x: p.x, y: p.y, z: p.z }));
+                    console.log('[CLIENT] Saved trail data:', trailData.length, 'points');
+
+                    // Clear trail visually from MY view
+                    if (gameState.snake.trailMesh) {
+                        disposeTrailMesh(gameState.snake.trailMesh);
+                        gameState.snake.trailMesh = null;
+                    }
+                    gameState.snake.trail = [];
+                    console.log('[CLIENT] Cleared my trail mesh');
+
                     // Notify server of death
                     if (room) {
                         console.log('[CLIENT] Sending player-died to Colyseus');
-                        room.send('player-died', {});
+                        room.send('player-died', {
+                            trail: trailData,
+                        });
                         console.log('[CLIENT] player-died sent');
                     } else {
                         console.log('[CLIENT] ERROR: No room connection, cannot notify server of death');
@@ -1221,6 +1300,86 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
                 // Check for item collection
                 checkItemCollection(gameState.snake.position);
 
+                // Add trail point every frame to record path (like slither.io)
+                // Validate position before adding to trail
+                if (gameState.snake.position &&
+                    typeof gameState.snake.position.x === 'number' &&
+                    isFinite(gameState.snake.position.x) &&
+                    isFinite(gameState.snake.position.y) &&
+                    isFinite(gameState.snake.position.z)) {
+
+                    if (gameState.snake.trail.length === 0 ||
+                        gameState.snake.trail[gameState.snake.trail.length - 1].distanceTo(gameState.snake.position) > 0.2) {
+                        gameState.snake.trail.push(gameState.snake.position.clone());
+
+                        // Remove old trail points from the front to maintain length
+                        // IMPORTANT: Never drop below 4 points (minimum for smooth trail mesh)
+                        while (gameState.snake.trail.length > Math.max(gameState.snake.length, 4)) {
+                            gameState.snake.trail.shift();
+                        }
+                    }
+                }
+
+                // Create render trail that ALWAYS includes current head position to prevent visual disconnection
+                // Robust validation: only include points that are valid Vector3 objects
+                const renderTrail: THREE.Vector3[] = [];
+                for (const p of gameState.snake.trail) {
+                    if (p &&
+                        typeof p.x === 'number' && typeof p.y === 'number' && typeof p.z === 'number' &&
+                        isFinite(p.x) && isFinite(p.y) && isFinite(p.z)) {
+                        renderTrail.push(new THREE.Vector3(p.x, p.y, p.z));
+                    }
+                }
+
+                // Always ensure current head position is included for smooth connection
+                if (gameState.snake.position &&
+                    typeof gameState.snake.position.x === 'number' &&
+                    isFinite(gameState.snake.position.x)) {
+                    if (renderTrail.length === 0 ||
+                        renderTrail[renderTrail.length - 1].distanceTo(gameState.snake.position) > 0.01) {
+                        renderTrail.push(gameState.snake.position.clone());
+                    }
+                }
+
+                // Update trail mesh every frame for smooth appearance
+                // Only render after a few frames to prevent weird spawn animation
+                if (renderTrail.length >= 2 && gameState.snake.spawnFrameCount > 15) {
+                    // Get the actual head color for uniform appearance
+                    let headColor = 0x00ffff;
+                    head.traverse((child) => {
+                        if (child instanceof THREE.Mesh && child.material instanceof THREE.MeshStandardMaterial) {
+                            const childColor = child.material.color.getHex();
+                            if (childColor !== 0xffffff && childColor !== 0x000000) {
+                                headColor = childColor;
+                            }
+                        }
+                    });
+                    gameState.snake.trailMesh = updateTrailMesh(renderTrail, gameState.snake.trailMesh, headColor);
+                } else if (gameState.snake.spawnFrameCount <= 15) {
+                    // Hide trail mesh during spawn animation
+                    if (gameState.snake.trailMesh) {
+                        disposeTrailMesh(gameState.snake.trailMesh);
+                        gameState.snake.trailMesh = null;
+                    }
+                    // Clear accumulated trail points right before we're about to render
+                    // This prevents the "huge trail blink" when transitioning to visible
+                    if (gameState.snake.spawnFrameCount === 15) {
+                        gameState.snake.trail = [
+                            gameState.snake.position.clone(),
+                            gameState.snake.position.clone().sub(gameState.snake.direction.clone().multiplyScalar(0.1)),
+                        ];
+                    }
+                }
+
+                // Update trail emissive intensity to match head when boosting
+                if (gameState.snake.trailMesh) {
+                    const targetIntensity = gameState.snake.boosting ? 1.0 : 0.5;
+                    gameState.snake.trailMesh.traverse((child) => {
+                        if (child instanceof THREE.Mesh && child.material instanceof THREE.MeshStandardMaterial) {
+                            child.material.emissiveIntensity = targetIntensity;
+                        }
+                    });
+                }
 
                 // Update snake light position
                 snakeLight.position.copy(gameState.snake.position);
@@ -1258,15 +1417,14 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
                 for (const item of gameState.items) {
                     if (!item.mesh.visible) continue;
 
-                    // Special animation for MEGA treasure items - always smooth and impressive!
+                    // Special animation for treasure items - always smooth!
                     if (item.type === 'treasure') {
-                        item.mesh.rotation.y += 0.06 * deltaTime; // Fast rotation
-                        item.mesh.rotation.x = Math.sin(Date.now() * 0.002) * 0.4; // Wobble
-                        item.mesh.rotation.z = Math.cos(Date.now() * 0.0015) * 0.3; // Extra wobble
-                        item.mesh.position.y = 1.0 + Math.sin(Date.now() * 0.003) * 0.8; // BIG bounce
+                        item.mesh.rotation.y += 0.05 * deltaTime; // Faster rotation
+                        item.mesh.rotation.x = Math.sin(Date.now() * 0.002) * 0.3; // Wobble
+                        item.mesh.position.y = 0.5 + Math.sin(Date.now() * 0.004) * 0.5; // Bigger bounce
 
-                        // Pulsing scale for treasure - makes it look like it's breathing
-                        const scale = 1.0 + Math.sin(Date.now() * 0.004) * 0.3;
+                        // Pulsing scale for treasure
+                        const scale = 1.0 + Math.sin(Date.now() * 0.003) * 0.2;
                         item.mesh.scale.set(scale, scale, scale);
                     } else if (frameCount % 2 === 0) {
                         // Normal items - animate every other frame for performance
@@ -1303,104 +1461,131 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
                     }
                 }
 
-                // Send input commands to server (throttled to 30Hz)
-                // Server is authoritative - we only send commands, not positions
-                // Block boost if player doesn't have enough mass (must be > 30, not >= 30)
-                const MIN_BOOST_LENGTH = 30;
-                const canBoost = gameState.snake.length > MIN_BOOST_LENGTH; // Must be > 30
-                const boostCommand = gameState.keys.boost && canBoost; // Only send boost if allowed
-
+                // Send player update to server (throttled to 30Hz)
                 if (room && gameStateRef.current.spawned && frameCount % 2 === 0) {
-                    room.send('input', {
-                        left: gameState.keys.left,
-                        right: gameState.keys.right,
-                        boost: boostCommand, // Send boost command only if allowed
+                    room.send('move', {
+                        x: gameState.snake.position.x,
+                        y: gameState.snake.position.y,
+                        z: gameState.snake.position.z,
+                        dirX: gameState.snake.direction.x,
+                        dirY: gameState.snake.direction.y,
+                        dirZ: gameState.snake.direction.z,
+                        boosting: gameState.snake.boosting,
+                        length: gameState.snake.trail.length,
                     });
                 }
 
-                // Clear boost key if player is too short
-                if (gameState.keys.boost && !canBoost) {
-                    gameState.keys.boost = false;
-                }
+                // Update multiplayer players - use server-authoritative trail for positioning
+                for (const [id, player] of gameState.multiplayerPlayers) {
+                    // CRITICAL: Head position MUST match trail mesh exactly
+                    // The server trail is authoritative - head is always at trail[0]
+                    if (player.trail && player.trail.length >= 2) {
+                        const serverHeadPos = player.trail[0];
+                        if (serverHeadPos &&
+                            typeof serverHeadPos.x === 'number' &&
+                            isFinite(serverHeadPos.x)) {
+                            // Set head directly from server trail (no interpolation)
+                            player.position.set(serverHeadPos.x, serverHeadPos.y, serverHeadPos.z);
+                            player.head.position.copy(player.position);
 
-                // Sync position from server (server is authoritative)
-                if (room && room.state && myPlayerId) {
-                    const myPlayer = room.state.players.get(myPlayerId);
-                    if (myPlayer && myPlayer.spawned) {
-                        // Server position is authoritative - sync to local state for rendering
-                        const serverPos = new THREE.Vector3(myPlayer.x, myPlayer.y, myPlayer.z);
-                        const serverDir = new THREE.Vector3(myPlayer.dirX || 0, myPlayer.dirY || 0, myPlayer.dirZ || -1);
+                            // Direction interpolation for smooth head rotation
+                            const directionLerpFactor = 0.2 * deltaTime;
+                            player.direction.lerp(player.targetDirection, directionLerpFactor);
+                            player.direction.normalize();
 
-                        // Smooth interpolation for visual quality (client-side prediction)
-                        const lerpFactor = Math.min(0.3 * deltaTime, 1.0);
-                        gameState.snake.position.lerp(serverPos, lerpFactor);
-                        gameState.snake.direction.lerp(serverDir.normalize(), lerpFactor);
-                        gameState.snake.direction.normalize();
-
-                        // Update boosting state from server
-                        gameState.snake.boosting = myPlayer.boosting || false;
-                        setIsBoosting(gameState.snake.boosting);
-
-                        // Score determines length - sync score from server length
-                        // When server decreases length (from boost), score must decrease too
-                        const newLength = myPlayer.length || 5;
-                        gameState.snake.length = newLength;
-                        setPlayerLength(newLength);
-
-                        // Score = length (score determines length, and decreases when boosting)
-                        // Always sync score to match length exactly (no threshold - boost changes are rapid)
-                        const newScore = newLength;
-                        gameStateRef.current.score = newScore;
-                        setScore(newScore);
-
-                        // Update level based on score
-                        const newLevel = Math.floor(newScore / 50);
-                        if (newLevel !== level) {
-                            setLevel(newLevel);
+                            const lookAtTarget = player.head.position.clone().add(player.direction);
+                            player.head.lookAt(lookAtTarget);
                         }
 
-                        // Score decreases when boosting (handled on server via length decrease)
-                        previousLengthRef.current = newLength;
+                        // Use slither.io approach: chain of spheres instead of tube mesh
+                        // TIME-BASED updates, not frame-based!
+                        if (player.trail.length >= 2) {
+                            const now = Date.now();
+                            const timeSinceUpdate = now - (player.lastMeshUpdateTime || 0);
 
-                        // Sync upgrades from server
-                        if (myPlayer.upgrades) {
-                            const serverUpgrades = Array.from(myPlayer.upgrades) as UpgradeType[];
-                            setActiveUpgrades(serverUpgrades);
-                        }
+                            // Update every 33ms (~30Hz) for smooth trails regardless of FPS
+                            const shouldUpdateMesh = !player.trailSegments || timeSinceUpdate >= 33;
 
-                        // Sync tail from server (server is authoritative)
-                        if (myPlayer.tail) {
-                            gameState.snake.tail = [];
-                            for (let i = 0; i < myPlayer.tail.length; i++) {
-                                const tailPoint = myPlayer.tail[i];
-                                if (tailPoint &&
-                                    typeof tailPoint.x === 'number' &&
-                                    typeof tailPoint.y === 'number' &&
-                                    typeof tailPoint.z === 'number' &&
-                                    isFinite(tailPoint.x) &&
-                                    isFinite(tailPoint.y) &&
-                                    isFinite(tailPoint.z)) {
-                                    gameState.snake.tail.push(new THREE.Vector3(tailPoint.x, tailPoint.y, tailPoint.z));
+                            if (shouldUpdateMesh) {
+                                player.lastMeshUpdateTime = now;
+
+                                let colorNum = 0xff00ff;
+                                if (player.color.startsWith('hsl')) {
+                                    const hue = parseInt(player.color.match(/\d+/)?.[0] || '0');
+                                    colorNum = new THREE.Color().setHSL(hue / 360, 0.7, 0.5).getHex();
+                                } else {
+                                    colorNum = parseInt(player.color.replace('#', ''), 16) || 0xff00ff;
+                                }
+
+                                // Create sphere-based trail if it doesn't exist
+                                if (!player.trailSegments) {
+                                    player.trailSegments = new THREE.Group();
+                                    scene.add(player.trailSegments);
+
+                                    // Create reusable sphere geometry and material
+                                    const segmentGeometry = new THREE.SphereGeometry(0.4, 8, 8);
+                                    const segmentMaterial = new THREE.MeshStandardMaterial({
+                                        color: colorNum,
+                                        emissive: colorNum,
+                                        emissiveIntensity: 0.5,
+                                    });
+
+                                    // Create spheres for each segment
+                                    for (let i = 0; i < player.trail.length; i++) {
+                                        const sphere = new THREE.Mesh(segmentGeometry, segmentMaterial);
+                                        sphere.position.copy(player.trail[i]);
+                                        player.trailSegments.add(sphere);
+                                    }
+                                } else {
+                                    // Update existing spheres - just move them to new positions!
+                                    const spheres = player.trailSegments.children as THREE.Mesh[];
+
+                                    // Add/remove spheres if trail length changed
+                                    while (spheres.length < player.trail.length) {
+                                        const sphere = spheres[0].clone();
+                                        player.trailSegments.add(sphere);
+                                    }
+                                    while (spheres.length > player.trail.length) {
+                                        const removed = player.trailSegments.children.pop();
+                                        if (removed) {
+                                            player.trailSegments.remove(removed);
+                                            (removed as THREE.Mesh).geometry.dispose();
+                                            ((removed as THREE.Mesh).material as THREE.Material).dispose();
+                                        }
+                                    }
+
+                                    // Update positions - INSTANT, no geometry recreation!
+                                    for (let i = 0; i < player.trail.length; i++) {
+                                        if (spheres[i] && player.trail[i]) {
+                                            spheres[i].position.copy(player.trail[i]);
+                                        }
+                                    }
                                 }
                             }
                         }
+                    } else if (player.trail && player.trail.length === 1) {
+                        // Just spawned - show head only
+                        const serverHeadPos = player.trail[0];
+                        if (serverHeadPos &&
+                            typeof serverHeadPos.x === 'number' &&
+                            isFinite(serverHeadPos.x)) {
+                            player.position.set(serverHeadPos.x, serverHeadPos.y, serverHeadPos.z);
+                            player.head.position.copy(player.position);
+                        }
+                    } else {
+                        // No trail yet - use interpolated position
+                        const distanceToTarget = player.position.distanceTo(player.targetPosition);
+                        let lerpFactor = distanceToTarget > 5 ? 0.5 : 0.3;
+                        player.position.lerp(player.targetPosition, lerpFactor * deltaTime);
+                        player.head.position.copy(player.position);
+
+                        const directionLerpFactor = 0.2 * deltaTime;
+                        player.direction.lerp(player.targetDirection, directionLerpFactor);
+                        player.direction.normalize();
+
+                        const lookAtTarget = player.head.position.clone().add(player.direction);
+                        player.head.lookAt(lookAtTarget);
                     }
-                }
-
-                // Update multiplayer players - use server position directly
-                for (const [id, player] of gameState.multiplayerPlayers) {
-                    // Use interpolated position from server
-                    const distanceToTarget = player.position.distanceTo(player.targetPosition);
-                    let lerpFactor = distanceToTarget > 5 ? 0.5 : 0.3;
-                    player.position.lerp(player.targetPosition, lerpFactor * deltaTime);
-                    player.head.position.copy(player.position);
-
-                    const directionLerpFactor = 0.2 * deltaTime;
-                    player.direction.lerp(player.targetDirection, directionLerpFactor);
-                    player.direction.normalize();
-
-                    const lookAtTarget = player.head.position.clone().add(player.direction);
-                    player.head.lookAt(lookAtTarget);
 
                     // Sanitize position
                     if (!isFinite(player.position.x) || !isFinite(player.position.y) || !isFinite(player.position.z)) {
@@ -1418,21 +1603,14 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
                     // Much larger culling distance to keep bots visible
                     if (distanceToPlayer > 400) {
                         player.head.visible = false;
+                        if (player.trailMesh) player.trailMesh.visible = false;
+                        if (player.trailSegments) player.trailSegments.visible = false;
                         player.light.visible = false;
-                        if (player.tailMesh) player.tailMesh.visible = false;
                     } else {
                         player.head.visible = true;
+                        if (player.trailMesh) player.trailMesh.visible = true;
+                        if (player.trailSegments) player.trailSegments.visible = true;
                         player.light.visible = true;
-                        if (player.tailMesh) player.tailMesh.visible = true;
-                    }
-
-                    // Update tail mesh for multiplayer players
-                    if (player.tail && player.tail.length > 0) {
-                        player.tailMesh = updateMultiplayerTailMesh(player, player.tail, player.tailMesh, player.color);
-                    } else if (player.tail.length === 0 && player.tailMesh) {
-                        // Remove tail mesh if no tail segments
-                        disposeTailMesh(player.tailMesh);
-                        player.tailMesh = null;
                     }
                 }
 
@@ -1441,8 +1619,7 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
                 cameraOffset.y = 8;
                 const targetCameraPosition = gameState.snake.position.clone().add(cameraOffset);
 
-                // Slower camera lerp for smoother movement (reduced from 0.1 to 0.05)
-                camera.position.lerp(targetCameraPosition, 0.05);
+                camera.position.lerp(targetCameraPosition, 0.1);
 
                 const lookAtPoint = gameState.snake.position.clone().add(
                     gameState.snake.direction.clone().multiplyScalar(10)
@@ -1526,27 +1703,54 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
                     .map(item => ({ x: item.position.x, z: item.position.z }));
             }
 
-            // Update tail mesh from server-authoritative tail data
-            if (gameStateRef.current.spawned && gameState.snake.tail.length > 0) {
-                // Get head color
-                let headColor = 0x00ffff;
-                head.traverse((child) => {
-                    if (child instanceof THREE.Mesh && child.material instanceof THREE.MeshStandardMaterial) {
-                        const childColor = child.material.color.getHex();
-                        if (childColor !== 0xffffff && childColor !== 0x000000) {
-                            headColor = childColor;
-                        }
-                    }
-                });
-
-                gameState.snake.tailMesh = updateTailMesh(gameState.snake.tail, gameState.snake.tailMesh, headColor) as THREE.Mesh | THREE.Group | null;
-            } else if (gameState.snake.tail.length === 0 && gameState.snake.tailMesh) {
-                // Remove tail mesh if no tail segments
-                disposeTailMesh(gameState.snake.tailMesh);
-                gameState.snake.tailMesh = null;
-            }
-
             renderer.render(scene, camera);
+        };
+
+        // Shared geometries and materials for items (CRITICAL for performance!)
+        const itemGeometries = {
+            common: new THREE.OctahedronGeometry(0.4, 0),
+            uncommon: new THREE.OctahedronGeometry(0.5, 0),
+            rare: new THREE.OctahedronGeometry(0.6, 0),
+            epic: new THREE.OctahedronGeometry(0.7, 0),
+            treasure: new THREE.OctahedronGeometry(1.0, 1),
+        };
+
+        const itemMaterials = {
+            common: new THREE.MeshStandardMaterial({
+                color: 0xffff00,
+                emissive: 0xffff00,
+                emissiveIntensity: 0.8,
+                metalness: 0.8,
+                roughness: 0.2,
+            }),
+            uncommon: new THREE.MeshStandardMaterial({
+                color: 0x00ff00,
+                emissive: 0x00ff00,
+                emissiveIntensity: 1.0,
+                metalness: 0.8,
+                roughness: 0.2,
+            }),
+            rare: new THREE.MeshStandardMaterial({
+                color: 0x0088ff,
+                emissive: 0x0088ff,
+                emissiveIntensity: 1.2,
+                metalness: 0.8,
+                roughness: 0.2,
+            }),
+            epic: new THREE.MeshStandardMaterial({
+                color: 0xff00ff,
+                emissive: 0xff00ff,
+                emissiveIntensity: 1.5,
+                metalness: 0.8,
+                roughness: 0.2,
+            }),
+            treasure: new THREE.MeshStandardMaterial({
+                color: 0xffd700,
+                emissive: 0xffd700,
+                emissiveIntensity: 2.0,
+                metalness: 1.0,
+                roughness: 0.1,
+            }),
         };
 
         // Spawn initial items - MUCH more with different rarities! (Using shared geometries)
@@ -1784,11 +1988,13 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
             minimapDataRef.current.mazes = spawnedMazes;
         };
 
-        // NOTE: Trees, obstacles, and mazes are now generated server-side!
-        // They will be synced from Colyseus state automatically
-        // spawnRandomMazes(3, 30); // DISABLED - now server-side
-        // spawnTrees(28); // DISABLED - now server-side
-        // spawnObstacles(5); // DISABLED - now server-side
+        spawnRandomMazes(3, 30); // 3 mazes for better performance, 30 unit size each
+
+        // Spawn fractal trees scattered around the world (balanced for Safari)
+        spawnTrees(28);
+
+        // Spawn minimal ring obstacles (only 5 for performance)
+        spawnObstacles(5);
 
         // Precompile shaders and warm up geometries to prevent initial lag
         console.log('[GAME] Precompiling shaders...');
@@ -1810,7 +2016,6 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
         (async () => {
             try {
                 room = await client.joinOrCreate('game');
-                roomRef.current = room; // Store in ref for access outside useEffect
                 myPlayerId = room.sessionId;
 
                 console.log('[COLYSEUS] Connected! Session ID:', myPlayerId);
@@ -1842,135 +2047,6 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
                             setPlayerColor(myPlayer.color);
                         }
                     }
-
-                    // Sync world objects from server
-                    if (state.worldGenerated) {
-                        console.log(`[COLYSEUS] Syncing world from server: ${state.trees.length} trees, ${state.obstacles.length} obstacles, ${state.mazes.length} mazes`);
-
-                        // Sync trees (use server-provided colors)
-                        state.trees.forEach((serverTree: any) => {
-                            const treeGroup = new THREE.Group();
-                            // Use server-provided color and height
-                            const treeColor = serverTree.color !== undefined ? serverTree.color : 0xff00ff;
-                            const treeHeight = serverTree.height !== undefined ? serverTree.height : 8;
-                            const tree = createFractalTree(new THREE.Vector3(serverTree.x, 0, serverTree.z), treeColor, treeHeight);
-                            treeGroup.add(tree.group);
-                            scene.add(treeGroup);
-                            gameState.trees.push({ position: new THREE.Vector3(serverTree.x, 0, serverTree.z), group: treeGroup });
-                        });
-
-                        // Sync obstacles (DISABLED - removed black balls)
-                        // state.obstacles.forEach((serverObstacle: any) => {
-                        //     const radius = serverObstacle.radius;
-                        //     const geometry = new THREE.SphereGeometry(radius, 12, 12);
-                        //     const material = new THREE.MeshStandardMaterial({
-                        //         color: 0x555555,
-                        //         roughness: 0.7,
-                        //         metalness: 0.3,
-                        //     });
-                        //     const mesh = new THREE.Mesh(geometry, material);
-                        //     mesh.position.set(serverObstacle.x, 0, serverObstacle.z);
-                        //     scene.add(mesh);
-                        //     gameState.obstacles.push({
-                        //         position: new THREE.Vector3(serverObstacle.x, 0, serverObstacle.z),
-                        //         mesh,
-                        //         radius,
-                        //     });
-                        // });
-
-                        // Sync mazes (use server-provided colors)
-                        const mazesToSync: Array<{ x: number; z: number }> = [];
-                        state.mazes.forEach((serverMaze: any) => {
-                            const mazeWalls: THREE.Mesh[] = [];
-
-                            // Use server-provided color for maze walls
-                            const mazeColor = serverMaze.color !== undefined ? serverMaze.color : 0xff00ff;
-                            const wallColor = new THREE.Color(mazeColor);
-                            const wallMaterial = new THREE.MeshStandardMaterial({
-                                color: wallColor,
-                                roughness: 0.4,
-                                emissive: wallColor,
-                                emissiveIntensity: 0.5,
-                                transparent: true,
-                                opacity: 0.6,
-                            });
-
-                            serverMaze.walls.forEach((wall: any) => {
-                                const wallGeometry = new THREE.BoxGeometry(wall.width, 3, wall.depth);
-                                const wallMesh = new THREE.Mesh(wallGeometry, wallMaterial);
-                                wallMesh.position.set(wall.x, 1.5, wall.z);
-                                scene.add(wallMesh);
-                                mazeWalls.push(wallMesh);
-
-                                // IMPORTANT: Add to allMazeWalls for collision detection!
-                                allMazeWalls.push({
-                                    position: new THREE.Vector3(wall.x, 1.5, wall.z),
-                                    width: wall.width,
-                                    depth: wall.depth,
-                                    mesh: wallMesh,
-                                });
-                            });
-
-                            // Add MEGA treasure - IMPORTANT: Add to gameState.items so it's collectible!
-                            // Make it BIG and POWERFUL - worth 100 points!
-                            console.log(`[MAZE] Creating treasure at (${serverMaze.treasureX}, ${serverMaze.treasureZ}) for maze at (${serverMaze.centerX}, ${serverMaze.centerZ})`);
-
-                            const treasureConfig = { color: 0xffd700, emissive: 0xffaa00, emissiveIntensity: 3.0, size: 1.5 };
-                            const treasureGeometry = new THREE.OctahedronGeometry(treasureConfig.size, 1); // More detail
-                            const treasureMaterial = new THREE.MeshStandardMaterial({
-                                color: treasureConfig.color,
-                                emissive: treasureConfig.emissive,
-                                emissiveIntensity: treasureConfig.emissiveIntensity,
-                                roughness: 0.1,
-                                metalness: 1.0,
-                            });
-                            const treasureMesh = new THREE.Mesh(treasureGeometry, treasureMaterial);
-                            treasureMesh.position.set(serverMaze.treasureX, 1, serverMaze.treasureZ); // Start at y=1 (will bounce from there)
-                            scene.add(treasureMesh);
-
-                            // Add a glowing light around the treasure
-                            const treasureLight = new THREE.PointLight(0xffd700, 3, 20); // Brighter and larger radius
-                            treasureLight.position.set(serverMaze.treasureX, 2, serverMaze.treasureZ);
-                            scene.add(treasureLight);
-
-                            // Find the treasure item in server state to get its ID
-                            let treasureItemId: string | undefined;
-                            if (room && room.state && room.state.items) {
-                                room.state.items.forEach((serverItem: any, itemId: string) => {
-                                    if (Math.abs(serverItem.x - serverMaze.treasureX) < 0.1 &&
-                                        Math.abs(serverItem.z - serverMaze.treasureZ) < 0.1 &&
-                                        serverItem.type === 'treasure') {
-                                        treasureItemId = itemId;
-                                    }
-                                });
-                            }
-
-                            // Add treasure to items array so it can be collected!
-                            gameState.items.push({
-                                id: treasureItemId, // Server item ID for respawn tracking
-                                position: new THREE.Vector3(serverMaze.treasureX, 0, serverMaze.treasureZ),
-                                mesh: treasureMesh,
-                                spawnTime: Date.now(),
-                                type: 'treasure',
-                                value: 30, // Match server value
-                            });
-
-                            console.log(`[MAZE] Treasure created! Total items: ${gameState.items.length}`);
-
-                            mazesToSync.push({ x: serverMaze.centerX, z: serverMaze.centerZ });
-                        });
-
-                        // Update minimap with mazes
-                        minimapDataRef.current.mazes = mazesToSync;
-
-                        // Update minimap with treasures (from items)
-                        minimapDataRef.current.treasures = gameState.items
-                            .filter(item => item.type === 'treasure')
-                            .map(item => ({ x: item.position.x, z: item.position.z }));
-
-                        console.log('[COLYSEUS] World sync complete!');
-                        console.log(`[COLYSEUS] Treasures on minimap: ${minimapDataRef.current.treasures.length}`);
-                    }
                 });
 
                 // Listen for server-authoritative death notifications
@@ -1982,9 +2058,6 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
                     gameStateRef.current.spawned = false;
                     setSpawned(false);
                 });
-
-                // Items will be synced via polling in the sync interval below
-                // MapSchema doesn't support onAdd/onRemove callbacks
 
                 // Manually sync player updates from Colyseus state (polling approach)
                 syncInterval = setInterval(() => {
@@ -2012,28 +2085,17 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
                                 direction
                             );
 
-
+                            // Trail will be synced from server - don't initialize client-side
+                            newPlayer.trail = []; // Server will populate this
                             newPlayer.position.copy(position);
                             newPlayer.targetPosition.copy(position);
                             newPlayer.targetDirection.copy(direction);
                             newPlayer.head.position.copy(position);
-                            newPlayer.velocity = new THREE.Vector3(0, 0, 0); // Initialize velocity
-                            newPlayer.lastUpdateTime = Date.now();
 
                             gameState.multiplayerPlayers.set(sessionId, newPlayer);
+                            console.log('[COLYSEUS] Player added:', sessionId);
                             updatePlayersOnlineCount();
                         } else if (multiPlayer && player.spawned) {
-                            // Calculate velocity for smooth prediction
-                            const now = Date.now();
-                            const deltaTime = (now - (multiPlayer.lastUpdateTime || now)) / 1000;
-                            if (deltaTime > 0 && deltaTime < 0.5) { // Reasonable time delta
-                                const newTargetPos = new THREE.Vector3(player.x, player.y, player.z);
-                                const displacement = newTargetPos.clone().sub(multiPlayer.targetPosition);
-                                if (!multiPlayer.velocity) multiPlayer.velocity = new THREE.Vector3();
-                                multiPlayer.velocity.copy(displacement.divideScalar(deltaTime));
-                            }
-                            multiPlayer.lastUpdateTime = now;
-
                             // Update from server state (no artificial latency, no client-side building)
                             multiPlayer.targetPosition.set(player.x, player.y, player.z);
                             multiPlayer.length = player.length;
@@ -2044,23 +2106,24 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
                                 multiPlayer.targetDirection.normalize();
                             }
 
-                            // Sync tail from server (server is authoritative)
-                            if (player.tail) {
-                                multiPlayer.tail = [];
-                                for (let i = 0; i < player.tail.length; i++) {
-                                    const tailPoint = player.tail[i];
-                                    if (tailPoint &&
-                                        typeof tailPoint.x === 'number' &&
-                                        typeof tailPoint.y === 'number' &&
-                                        typeof tailPoint.z === 'number' &&
-                                        isFinite(tailPoint.x) &&
-                                        isFinite(tailPoint.y) &&
-                                        isFinite(tailPoint.z)) {
-                                        multiPlayer.tail.push(new THREE.Vector3(tailPoint.x, tailPoint.y, tailPoint.z));
-                                    }
+                            // Sync trail from server (ONLY source of trail data)
+                            if (player.trail && player.trail.length > 0) {
+                                // Update trail in place to avoid race conditions with render loop
+                                const newTrailLength = player.trail.length;
+
+                                // Resize array if needed
+                                if (multiPlayer.trail.length !== newTrailLength) {
+                                    multiPlayer.trail.length = newTrailLength;
                                 }
-                            } else {
-                                multiPlayer.tail = [];
+
+                                // Update each point
+                                for (let i = 0; i < newTrailLength; i++) {
+                                    const trailPoint = player.trail[i];
+                                    if (!multiPlayer.trail[i]) {
+                                        multiPlayer.trail[i] = new THREE.Vector3();
+                                    }
+                                    multiPlayer.trail[i].set(trailPoint.x, trailPoint.y, trailPoint.z);
+                                }
                             }
 
                             // Check if player teleported (respawned) - snap to new position
@@ -2074,7 +2137,18 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
                             // Player died - remove from scene
                             scene.remove(multiPlayer.head);
                             scene.remove(multiPlayer.light);
-                            disposeTailMesh(multiPlayer.tailMesh);
+                            if (multiPlayer.trailMesh) {
+                                disposeTrailMesh(multiPlayer.trailMesh);
+                            }
+                            if (multiPlayer.trailSegments) {
+                                multiPlayer.trailSegments.traverse((child) => {
+                                    if (child instanceof THREE.Mesh) {
+                                        child.geometry.dispose();
+                                        if (child.material) (child.material as THREE.Material).dispose();
+                                    }
+                                });
+                                scene.remove(multiPlayer.trailSegments);
+                            }
                             gameState.multiplayerPlayers.delete(sessionId);
                             console.log('[COLYSEUS] Player died:', sessionId);
                             updatePlayersOnlineCount();
@@ -2087,7 +2161,18 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
                             if (room && room.state?.players && !room.state.players.has(sessionId)) {
                                 scene.remove(multiPlayer.head);
                                 scene.remove(multiPlayer.light);
-                                disposeTailMesh(multiPlayer.tailMesh);
+                                if (multiPlayer.trailMesh) {
+                                    disposeTrailMesh(multiPlayer.trailMesh);
+                                }
+                                if (multiPlayer.trailSegments) {
+                                    multiPlayer.trailSegments.traverse((child) => {
+                                        if (child instanceof THREE.Mesh) {
+                                            child.geometry.dispose();
+                                            if (child.material) (child.material as THREE.Material).dispose();
+                                        }
+                                    });
+                                    scene.remove(multiPlayer.trailSegments);
+                                }
                                 gameState.multiplayerPlayers.delete(sessionId);
                                 console.log('[COLYSEUS] Player left:', sessionId);
                                 updatePlayersOnlineCount();
@@ -2139,7 +2224,9 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
             for (const [id, player] of gameState.multiplayerPlayers) {
                 scene.remove(player.head);
                 scene.remove(player.light);
-                disposeTailMesh(player.tailMesh);
+                if (player.trailMesh) {
+                    disposeTrailMesh(player.trailMesh);
+                }
             }
 
             // Clean up trees
@@ -2168,6 +2255,133 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
         isFocusedRef.current = isActive ?? true; // Default to true if no prop provided
     }, [isActive]);
 
+    // Minimap rendering
+    useEffect(() => {
+        if (!minimapCanvasRef.current) return;
+
+        const canvas = minimapCanvasRef.current;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+
+        let minimapFrameCount = 0;
+        const drawMinimap = () => {
+            minimapFrameCount++;
+
+            // Only render minimap every 4 frames (15fps instead of 60fps) for performance
+            if (minimapFrameCount % 4 !== 0) {
+                requestAnimationFrame(drawMinimap);
+                return;
+            }
+
+            // Clear canvas
+            ctx.fillStyle = 'rgba(10, 10, 10, 0.9)';
+            ctx.fillRect(0, 0, 200, 200);
+
+            // Draw grid
+            ctx.strokeStyle = 'rgba(0, 255, 255, 0.1)';
+            ctx.lineWidth = 0.5;
+            for (let i = 0; i <= 200; i += 40) {
+                ctx.beginPath();
+                ctx.moveTo(i, 0);
+                ctx.lineTo(i, 200);
+                ctx.stroke();
+                ctx.beginPath();
+                ctx.moveTo(0, i);
+                ctx.lineTo(200, i);
+                ctx.stroke();
+            }
+
+            const worldSize = 1000;
+            const scale = 200 / worldSize;
+
+            // Helper function to convert world coordinates to minimap coordinates
+            const worldToMinimap = (x: number, z: number) => ({
+                x: (x + worldSize / 2) * scale,
+                y: (z + worldSize / 2) * scale,
+            });
+
+            // Draw maze boundaries
+            ctx.fillStyle = 'rgba(0, 255, 255, 0.2)';
+            ctx.strokeStyle = 'rgba(0, 255, 255, 0.4)';
+            ctx.lineWidth = 1;
+            for (const maze of minimapDataRef.current.mazes) {
+                const pos = worldToMinimap(maze.x, maze.z);
+                const size = 25 * scale; // 25 unit maze size
+                ctx.fillRect(pos.x - size / 2, pos.y - size / 2, size, size);
+                ctx.strokeRect(pos.x - size / 2, pos.y - size / 2, size, size);
+            }
+
+            // Draw treasures
+            for (const treasure of minimapDataRef.current.treasures) {
+                const pos = worldToMinimap(treasure.x, treasure.z);
+                ctx.fillStyle = 'rgba(255, 215, 0, 1)';
+                ctx.shadowColor = 'rgba(255, 215, 0, 0.8)';
+                ctx.shadowBlur = 5;
+                ctx.beginPath();
+                ctx.arc(pos.x, pos.y, 4, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.shadowBlur = 0;
+            }
+
+            // Draw multiplayer players
+            for (const player of minimapDataRef.current.multiplayerPlayers) {
+                const pos = worldToMinimap(player.x, player.z);
+                ctx.fillStyle = 'rgba(138, 43, 226, 0.9)'; // Purple for other players
+                ctx.shadowColor = 'rgba(138, 43, 226, 0.6)';
+                ctx.shadowBlur = 4;
+                ctx.beginPath();
+                ctx.arc(pos.x, pos.y, 3, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.shadowBlur = 0;
+            }
+
+            // Draw player
+            const playerPos = worldToMinimap(
+                minimapDataRef.current.playerPos.x,
+                minimapDataRef.current.playerPos.z
+            );
+            ctx.fillStyle = 'rgba(0, 255, 255, 1)';
+            ctx.shadowColor = 'rgba(0, 255, 255, 1)';
+            ctx.shadowBlur = 8;
+            ctx.beginPath();
+            ctx.arc(playerPos.x, playerPos.y, 4, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.shadowBlur = 0;
+
+            // Draw player direction indicator (arrow showing where player is facing)
+            const playerDir = minimapDataRef.current.playerDirection;
+            const dirAngle = Math.atan2(playerDir.z, playerDir.x); // Use actual player direction
+
+            // Draw direction arrow
+            ctx.strokeStyle = 'rgba(0, 255, 255, 1)';
+            ctx.fillStyle = 'rgba(0, 255, 255, 1)';
+            ctx.lineWidth = 2;
+
+            // Arrow line
+            ctx.beginPath();
+            ctx.moveTo(playerPos.x, playerPos.y);
+            const arrowLength = 10;
+            const arrowEndX = playerPos.x + Math.cos(dirAngle) * arrowLength;
+            const arrowEndY = playerPos.y + Math.sin(dirAngle) * arrowLength;
+            ctx.lineTo(arrowEndX, arrowEndY);
+            ctx.stroke();
+
+            // Arrow head (triangle)
+            const headSize = 3;
+            const angle1 = dirAngle + Math.PI * 0.8;
+            const angle2 = dirAngle - Math.PI * 0.8;
+            ctx.beginPath();
+            ctx.moveTo(arrowEndX, arrowEndY);
+            ctx.lineTo(arrowEndX + Math.cos(angle1) * headSize, arrowEndY + Math.sin(angle1) * headSize);
+            ctx.lineTo(arrowEndX + Math.cos(angle2) * headSize, arrowEndY + Math.sin(angle2) * headSize);
+            ctx.closePath();
+            ctx.fill();
+
+            requestAnimationFrame(drawMinimap);
+        };
+
+        drawMinimap();
+    }, [spawned]);
 
     const isFocused = isActive ?? true; // Use prop or default to true
 
@@ -2188,13 +2402,59 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
             />
 
             {/* Loading Indicator */}
-            {isLoading && <LoadingIndicator />}
+            {isLoading && (
+                <div className="absolute inset-0 flex items-center justify-center bg-black bg-opacity-90 pointer-events-none z-50">
+                    <div className="text-center">
+                        <div className="text-4xl font-bold text-cyan-400 tracking-wider mb-4 animate-pulse drop-shadow-[0_0_20px_rgba(0,255,255,0.8)]">
+                            LOADING...
+                        </div>
+                        <div className="text-sm text-cyan-300 tracking-widest uppercase">
+                            Compiling Shaders
+                        </div>
+                    </div>
+                </div>
+            )}
 
             {/* Focus Indicator */}
-            {!isFocused && <FocusIndicator />}
+            {!isFocused && (
+                <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                    <div className="text-xl font-bold text-white bg-black bg-opacity-70 px-6 py-3 rounded-lg animate-pulse">
+                        HOVER TO CONTROL
+                    </div>
+                </div>
+            )}
 
             {/* HUD - only show when spawned */}
-            {spawned && <HUD score={score} level={level} />}
+            {spawned && (
+                <div className="absolute top-8 left-1/2 transform -translate-x-1/2 text-center pointer-events-none">
+                    <div className="flex items-baseline gap-6 justify-center">
+                        <div>
+                            <div className="text-3xl font-bold text-cyan-400 tracking-wider drop-shadow-[0_0_10px_rgba(0,255,255,0.8)]">
+                                {score}
+                            </div>
+                            <div className="text-xs text-cyan-300 mt-1 tracking-widest uppercase">
+                                Score
+                            </div>
+                        </div>
+                        <div>
+                            <div className="text-3xl font-bold text-yellow-400 tracking-wider drop-shadow-[0_0_10px_rgba(255,255,0,0.8)]">
+                                {itemsCollected}
+                            </div>
+                            <div className="text-xs text-yellow-300 mt-1 tracking-widest uppercase">
+                                Items
+                            </div>
+                        </div>
+                        <div>
+                            <div className="text-3xl font-bold text-purple-400 tracking-wider drop-shadow-[0_0_10px_rgba(168,85,247,0.8)]">
+                                {level}
+                            </div>
+                            <div className="text-xs text-purple-300 mt-1 tracking-widest uppercase">
+                                Level
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            )}
 
             {/* Players Online Counter & Leaderboard */}
             <div className="absolute top-8 right-8 text-right pointer-events-none">
@@ -2242,13 +2502,18 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
                 )}
             </div>
 
-            {/* Boost Indicator (center screen when boosting) */}
-            {isBoosting && <BoostIndicator />}
-
+            {/* Boost Indicator */}
+            {isBoosting && (
+                <div className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 pointer-events-none">
+                    <div className="text-6xl font-bold text-yellow-400 tracking-wider animate-pulse drop-shadow-[0_0_20px_rgba(255,255,0,1)]">
+                        BOOST!
+                    </div>
+                </div>
+            )}
 
             {/* Controls - only show when spawned */}
             {spawned && (
-                <div className="absolute bottom-24 left-1/2 transform -translate-x-1/2 text-center pointer-events-none">
+                <div className="absolute bottom-8 left-1/2 transform -translate-x-1/2 text-center pointer-events-none">
                     <div className="text-cyan-300 text-sm tracking-wider">
                         <div className="flex gap-6 mb-2 justify-center items-center">
                             <div>← / →</div>
@@ -2393,7 +2658,39 @@ export default function SnakeGame({ isActive }: { isActive?: boolean } = {}) {
             </div>
 
             {/* Minimap - Bottom Right */}
-            {spawned && <Minimap data={minimapDataRef.current} />}
+            {spawned && (
+                <div className="absolute bottom-8 right-8 pointer-events-none">
+                    <div className="bg-black/70 border-2 border-cyan-400/50 rounded-lg p-2 shadow-2xl backdrop-blur-sm">
+                        <div className="text-xs text-cyan-300 mb-1 text-center tracking-widest uppercase font-bold">
+                            Map
+                        </div>
+                        <canvas
+                            ref={minimapCanvasRef}
+                            width={200}
+                            height={200}
+                            className="rounded border border-cyan-500/30"
+                        />
+                        <div className="grid grid-cols-2 gap-x-2 gap-y-1 mt-2 text-xs">
+                            <div className="flex items-center gap-1">
+                                <div className="w-2 h-2 bg-cyan-400 rounded-full shadow-glow-cyan"></div>
+                                <span className="text-cyan-300">You</span>
+                            </div>
+                            <div className="flex items-center gap-1">
+                                <div className="w-2 h-2 bg-red-400 rounded-full"></div>
+                                <span className="text-red-300">Bots</span>
+                            </div>
+                            <div className="flex items-center gap-1">
+                                <div className="w-2 h-2 bg-purple-400 rounded-full"></div>
+                                <span className="text-purple-300">Players</span>
+                            </div>
+                            <div className="flex items-center gap-1">
+                                <div className="w-2 h-2 bg-yellow-400 rounded-full shadow-glow-yellow"></div>
+                                <span className="text-yellow-300">Treasure</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
     );
 }
